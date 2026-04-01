@@ -1,0 +1,23 @@
+{
+  "name": "antigravity-to-claude",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "agcc": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "build:native": "cc -shared -fPIC -o native/dns_redirect.dylib native/dns_redirect.c",
+    "start": "node dist/cli.js",
+    "test:e2e": "vitest run --config vitest.e2e.config.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.15",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.2"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.11.0"
+  }
+}

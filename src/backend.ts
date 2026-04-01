@@ -1,0 +1,373 @@
+/**
+ * backend.ts — LS binary lifecycle management.
+ *
+ * Handles:
+ *   1. OAuth token refresh (refresh_token → access_token)
+ *   2. Mock Extension Server with USS OAuth injection
+ *   3. Go binary spawn with DYLD_INSERT_LIBRARIES DNS redirect
+ *   4. ConnectRPC calls (StartCascade, SendUserCascadeMessage)
+ *
+ * No agent/chat abstraction — just raw LS management.
+ */
+
+import { createServer as createHttpServer, type Server as HttpServer } from "http"
+import { request as httpsRequest } from "https"
+import { createServer as createNetServer } from "net"
+import { spawn, type ChildProcess } from "child_process"
+import { tmpdir, platform, homedir } from "os"
+import { join, dirname } from "path"
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs"
+import { fileURLToPath } from "url"
+import { randomBytes, randomUUID } from "crypto"
+import {
+  buildOAuthUSSUpdate,
+  encodeEnvelope,
+  protoEncodeBytes,
+  decodeEnvelopes,
+  protoDecodeFields,
+  getSchemas,
+} from "./proto.js"
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+
+const CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+const CLIENT_SECRET = "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"
+const ANYCODE_DIR = join(homedir(), ".anycode")
+const TOKEN_CACHE_PATH = join(ANYCODE_DIR, "oauth_token.json")
+
+// ─── Binary resolution ───────────────────────────────────────────────────────
+
+function resolveBinaryPath(): string {
+  const os = platform()
+  const binaryMap: Record<string, string> = {
+    darwin: "language_server_macos_arm",
+    linux: "language_server_linux_x64",
+  }
+  const binaryName = binaryMap[os]
+  if (!binaryName) throw new Error(`Unsupported platform: ${os}`)
+
+  // Check bundled binary first (in bin/ next to dist/)
+  const bundled = join(__dirname, "..", "bin", binaryName)
+  if (existsSync(bundled)) return bundled
+
+  // Fallback to system installations
+  if (os === "darwin") {
+    const appBin = `/Applications/Antigravity.app/Contents/Resources/app/extensions/antigravity/bin/${binaryName}`
+    if (existsSync(appBin)) return appBin
+  } else if (os === "linux") {
+    const sysPath = `/usr/share/antigravity/resources/app/extensions/antigravity/bin/${binaryName}`
+    if (existsSync(sysPath)) return sysPath
+  }
+
+  throw new Error(
+    `Go binary (${binaryName}) not found. Either:\n` +
+    `  1. Place it in bin/${binaryName}\n` +
+    `  2. Install Antigravity on your system`
+  )
+}
+
+// ─── Backend ─────────────────────────────────────────────────────────────────
+
+export interface BackendOptions {
+  refreshToken: string
+  /** Path to dns_redirect.dylib for DYLD_INSERT_LIBRARIES */
+  dylibPath?: string
+  /** Path to combined CA file for SSL_CERT_FILE */
+  sslCertFile?: string
+}
+
+export class Backend {
+  private refreshToken: string
+  private accessToken = ""
+  private lsCsrf = randomUUID()
+  private extCsrf = randomUUID()
+  private lsPort = 0
+  private extServer: HttpServer | null = null
+  private binaryChild: ChildProcess | null = null
+  private pipeServer: any = null
+  private dylibPath?: string
+  private sslCertFile?: string
+  private oauthResolve: (() => void) | null = null
+  private oauthPromise: Promise<void> | null = null
+
+  constructor(opts: BackendOptions) {
+    this.refreshToken = opts.refreshToken
+    this.dylibPath = opts.dylibPath
+    this.sslCertFile = opts.sslCertFile
+  }
+
+  /** Initialize: refresh token → start ext server → spawn binary → inject OAuth */
+  async init(): Promise<void> {
+    const binaryPath = resolveBinaryPath()
+    console.log(`[Backend] Binary: ${binaryPath}`)
+    getSchemas() // Validate proto schemas
+
+    // 1. Refresh access token
+    console.log("[Backend] Refreshing access token...")
+    await this.refreshAccessToken()
+    console.log("[Backend] ✅ Access token obtained")
+
+    // 2. Start mock extension server
+    this.oauthPromise = new Promise((resolve) => { this.oauthResolve = resolve })
+    const extPort = await this.startExtensionServer()
+    console.log(`[Backend] ✅ Extension server on port ${extPort}`)
+
+    // 3. Spawn Go binary
+    await this.spawnBinary(extPort, binaryPath)
+    console.log(`[Backend] ✅ Language server on port ${this.lsPort}`)
+
+    // 4. Wait for OAuth injection
+    console.log("[Backend] Waiting for OAuth injection...")
+    const timeout = new Promise<void>((_, reject) =>
+      setTimeout(() => reject(new Error("OAuth injection timed out (30s)")), 30000)
+    )
+    await Promise.race([this.oauthPromise, timeout])
+    console.log("[Backend] ✅ OAuth token injected via USS")
+  }
+
+  /** Create a new cascade via RPC, return cascadeId */
+  async createCascade(): Promise<string> {
+    const res = await this.rpc("StartCascade")
+    return res.cascadeId
+  }
+
+  /** Send a message on a cascade (used to trigger streamGenerateContent) */
+  async sendMessage(cascadeId: string, text: string): Promise<void> {
+    const plannerConfig = {
+      conversational: {
+        plannerMode: "CONVERSATIONAL_PLANNER_MODE_DEFAULT",
+        agenticMode: true,
+      },
+      cascadeCanAutoRunCommands: true,
+      toolConfig: {
+        runCommand: { forceDisable: true },
+        searchWeb: { forceDisable: true },
+        generateImage: { forceDisable: true },
+        browserSubagent: { forceDisable: true },
+      },
+      requestedModel: { model: "MODEL_PLACEHOLDER_M26" },
+      ephemeralMessagesConfig: { enabled: false },
+      knowledgeConfig: { enabled: false },
+      promptSectionCustomizationConfig: {
+        removePromptSections: [
+          "identity", "web_application_development", "planning_mode",
+          "planning_mode_artifacts", "artifacts", "skills", "plugins",
+          "persistent_context", "ephemeral_message", "communication_style", "tool_calling",
+        ],
+      },
+    }
+
+    await this.rpc("SendUserCascadeMessage", {
+      cascadeId,
+      items: [{ text }],
+      cascadeConfig: {
+        plannerConfig,
+        conversationHistoryConfig: { enabled: false },
+      },
+      clientType: "CHAT_CLIENT_REQUEST_STREAM_CLIENT_TYPE_IDE",
+    })
+  }
+
+  /** Clean up all resources */
+  destroy(): void {
+    this.binaryChild?.kill()
+    this.extServer?.close()
+    this.pipeServer?.close()
+  }
+
+  // ─── Internal ──────────────────────────────────────────────────────────────
+
+  private async refreshAccessToken(): Promise<void> {
+    // Try cache first
+    try {
+      const cached = JSON.parse(readFileSync(TOKEN_CACHE_PATH, "utf-8"))
+      if (cached.access_token && cached.expires_at && Date.now() < cached.expires_at - 60_000) {
+        this.accessToken = cached.access_token
+        console.log("[Backend] ✅ Using cached access token")
+        return
+      }
+    } catch { /* cache miss */ }
+
+    return new Promise((resolve, reject) => {
+      const params = new URLSearchParams({
+        client_id: CLIENT_ID,
+        client_secret: CLIENT_SECRET,
+        refresh_token: this.refreshToken,
+        grant_type: "refresh_token",
+      })
+      const req = httpsRequest("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      }, (res) => {
+        let d = ""
+        res.on("data", (c: Buffer) => (d += c))
+        res.on("end", () => {
+          try {
+            const json = JSON.parse(d)
+            if (json.error) {
+              reject(new Error(`OAuth error: ${json.error_description || json.error}`))
+              return
+            }
+            this.accessToken = json.access_token
+            try {
+              mkdirSync(ANYCODE_DIR, { recursive: true })
+              writeFileSync(TOKEN_CACHE_PATH, JSON.stringify({
+                access_token: json.access_token,
+                expires_at: Date.now() + (json.expires_in || 3600) * 1000,
+              }), "utf-8")
+            } catch { /* ignore cache write errors */ }
+            resolve()
+          } catch {
+            reject(new Error(`Failed to parse token response: ${d}`))
+          }
+        })
+      })
+      req.on("error", reject)
+      req.write(params.toString())
+      req.end()
+    })
+  }
+
+  private startExtensionServer(): Promise<number> {
+    return new Promise((resolve) => {
+      const server = createHttpServer((req, res) => {
+        const rpcPath = req.url || ""
+        let body: Buffer[] = []
+        req.on("data", (chunk: Buffer) => body.push(chunk))
+        req.on("end", () => {
+          const rawBody = Buffer.concat(body)
+
+          if (rpcPath.includes("SubscribeToUnifiedStateSyncTopic")) {
+            let topic = ""
+            try {
+              const frames = decodeEnvelopes(rawBody)
+              if (frames.length > 0) topic = protoDecodeFields(frames[0].body).field1 || ""
+            } catch { }
+
+            res.writeHead(200, {
+              "Content-Type": "application/connect+proto",
+              "Transfer-Encoding": "chunked",
+            })
+            res.flushHeaders()
+            if (res.socket) res.socket.setNoDelay(true)
+
+            if (topic === "uss-oauth" && this.accessToken) {
+              res.write(encodeEnvelope(buildOAuthUSSUpdate(this.accessToken, this.refreshToken)))
+              this.oauthResolve?.()
+            } else {
+              res.write(encodeEnvelope(protoEncodeBytes(1, Buffer.alloc(0))))
+            }
+            return // keep stream open
+          }
+
+          res.writeHead(200, { "Content-Type": "application/proto" })
+          res.end(Buffer.alloc(0))
+        })
+      })
+
+      server.listen(0, "127.0.0.1", () => {
+        this.extServer = server
+        resolve((server.address() as any).port)
+      })
+    })
+  }
+
+  private spawnBinary(extPort: number, binaryPath: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const pipePath = join(tmpdir(), `agcc_${randomBytes(4).toString("hex")}`)
+      const pipeServer = createNetServer(() => { })
+
+      pipeServer.listen(pipePath, () => {
+        this.pipeServer = pipeServer
+
+        const childEnv: Record<string, string> = { ...(process.env as any) }
+
+        // DNS redirect via dylib injection (replaces /etc/hosts)
+        if (this.dylibPath && existsSync(this.dylibPath)) {
+          childEnv.DYLD_INSERT_LIBRARIES = this.dylibPath
+          console.log(`[Backend] DNS redirect: ${this.dylibPath}`)
+        }
+
+        // SSL cert for MITM
+        if (this.sslCertFile) {
+          childEnv.SSL_CERT_FILE = this.sslCertFile
+          childEnv.SSL_CERT_DIR = "/dev/null"
+        }
+
+        const endpoint = "https://daily-cloudcode-pa.googleapis.com"
+
+        const child = spawn(binaryPath, [
+          "--csrf_token", this.lsCsrf,
+          "--https_server_port", "0",
+          "--workspace_id", "agcc-session",
+          "--cloud_code_endpoint", endpoint,
+          "--app_data_dir", "antigravity",
+          "--extension_server_port", String(extPort),
+          "--extension_server_csrf_token", this.extCsrf,
+          "--parent_pipe_path", pipePath,
+        ], { stdio: ["pipe", "pipe", "pipe"], env: childEnv })
+
+        this.binaryChild = child
+
+        child.stdin.write(Buffer.from([0x0a, 0x04, 0x74, 0x65, 0x73, 0x74]))
+        child.stdin.end()
+
+        let resolved = false
+        const timeout = setTimeout(() => {
+          if (!resolved) { resolved = true; reject(new Error("Binary startup timed out (30s)")) }
+        }, 30000)
+
+        child.stderr.on("data", (d: Buffer) => {
+          const text = d.toString()
+          for (const line of text.split("\n")) {
+            if (line.trim()) console.log(`[Binary] ${line}`)
+          }
+          const m = text.match(/listening on random port at (\d+) for HTTPS/)
+          if (m && !resolved) {
+            resolved = true
+            clearTimeout(timeout)
+            this.lsPort = parseInt(m[1])
+            resolve()
+          }
+        })
+
+        child.on("error", (err) => {
+          if (!resolved) { resolved = true; clearTimeout(timeout); reject(err) }
+        })
+        child.on("exit", (code) => {
+          if (!resolved) { resolved = true; clearTimeout(timeout); reject(new Error(`Binary exited with code ${code}`)) }
+        })
+      })
+    })
+  }
+
+  private rpc(method: string, body: any = {}): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const data = JSON.stringify(body)
+      const timeout = setTimeout(() => { req.destroy(); reject(new Error(`RPC ${method} timed out`)) }, 30000)
+      const req = httpsRequest({
+        hostname: "127.0.0.1",
+        port: this.lsPort,
+        path: `/exa.language_server_pb.LanguageServerService/${method}`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-codeium-csrf-token": this.lsCsrf,
+          "Content-Length": Buffer.byteLength(data),
+          Connection: "close",
+        },
+        rejectUnauthorized: false,
+      }, (res) => {
+        let d = ""
+        res.on("data", (c: Buffer) => (d += c))
+        res.on("end", () => {
+          clearTimeout(timeout)
+          try { resolve(JSON.parse(d)) } catch { resolve(d) }
+        })
+      })
+      req.on("error", (err) => { clearTimeout(timeout); reject(err) })
+      req.write(data)
+      req.end()
+    })
+  }
+}
