@@ -339,26 +339,17 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
         delete (options.headers as any)["transfer-encoding"]
 
         const proxyReq = httpsRequest(options, (proxyRes) => {
-          // Build response headers
-          let responseHead = `HTTP/1.1 ${proxyRes.statusCode} ${proxyRes.statusMessage}\r\n`
-          for (const [key, val] of Object.entries(proxyRes.headers)) {
-            if (val) responseHead += `${key}: ${Array.isArray(val) ? val.join(", ") : val}\r\n`
-          }
-          responseHead += "\r\n"
-          socket.write(responseHead)
+          if (ctx && isGenerateContent) {
+            // ── Intercepted request: capture real response, send fake to LS ──
+            const responseChunks: Buffer[] = []
 
-          // Buffer response for MITM capture
-          const responseChunks: Buffer[] = []
+            proxyRes.on("data", (chunk: Buffer) => {
+              responseChunks.push(chunk)
+              // Do NOT forward real response to LS
+            })
 
-          proxyRes.on("data", (chunk: Buffer) => {
-            responseChunks.push(chunk)
-            socket.write(chunk)
-          })
-
-          proxyRes.on("end", () => {
-            socket.end()
-            // Process captured response
-            if (ctx && isGenerateContent) {
+            proxyRes.on("end", () => {
+              // 1. Process real Google response → emit events to client
               const fullResponse = Buffer.concat(responseChunks)
               try {
                 processResponseSSE(fullResponse, ctx)
@@ -369,8 +360,36 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
                   message: String(e),
                 } satisfies MitmEvent)
               }
+
+              // 2. Send fake simple text response to LS → cascade goes IDLE
+              const fakeSSE = `data: {"candidates":[{"content":{"parts":[{"text":"ok"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1}}\n\n`
+              const fakeBody = Buffer.from(fakeSSE)
+              const fakeHeaders =
+                `HTTP/1.1 200 OK\r\n` +
+                `Content-Type: text/event-stream\r\n` +
+                `Content-Length: ${fakeBody.length}\r\n` +
+                `\r\n`
+              socket.write(fakeHeaders)
+              socket.write(fakeBody)
+              socket.end()
+            })
+          } else {
+            // ── Normal pass-through (non-intercepted traffic) ──
+            let responseHead = `HTTP/1.1 ${proxyRes.statusCode} ${proxyRes.statusMessage}\r\n`
+            for (const [key, val] of Object.entries(proxyRes.headers)) {
+              if (val) responseHead += `${key}: ${Array.isArray(val) ? val.join(", ") : val}\r\n`
             }
-          })
+            responseHead += "\r\n"
+            socket.write(responseHead)
+
+            proxyRes.on("data", (chunk: Buffer) => {
+              socket.write(chunk)
+            })
+
+            proxyRes.on("end", () => {
+              socket.end()
+            })
+          }
         })
 
         proxyReq.on("error", (e) => {
