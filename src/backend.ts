@@ -46,24 +46,10 @@ function resolveBinaryPath(): string {
   const binaryName = binaryMap[os]
   if (!binaryName) throw new Error(`Unsupported platform: ${os}`)
 
-  // Check bundled binary first (in bin/ next to dist/)
   const bundled = join(__dirname, "..", "bin", binaryName)
   if (existsSync(bundled)) return bundled
 
-  // Fallback to system installations
-  if (os === "darwin") {
-    const appBin = `/Applications/Antigravity.app/Contents/Resources/app/extensions/antigravity/bin/${binaryName}`
-    if (existsSync(appBin)) return appBin
-  } else if (os === "linux") {
-    const sysPath = `/usr/share/antigravity/resources/app/extensions/antigravity/bin/${binaryName}`
-    if (existsSync(sysPath)) return sysPath
-  }
-
-  throw new Error(
-    `Go binary (${binaryName}) not found. Either:\n` +
-    `  1. Place it in bin/${binaryName}\n` +
-    `  2. Install Antigravity on your system`
-  )
+  throw new Error(`Go binary not found at ${bundled}`)
 }
 
 // ─── Backend ─────────────────────────────────────────────────────────────────

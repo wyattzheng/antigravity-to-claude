@@ -9,19 +9,19 @@
  * project, model, and JSON structure only.
  */
 
-import { createServer as createTlsServer } from "tls"
+import { createServer as createTlsServer, rootCertificates } from "tls"
 import { request as httpsRequest } from "https"
+import { resolve4 } from "dns"
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs"
-import { join, dirname } from "path"
-import { execSync } from "child_process"
-import { randomBytes } from "crypto"
+import { join } from "path"
+import selfsigned from "selfsigned"
 import { MitmStore, type RequestContext, type MitmEvent } from "./store.js"
 import { parseGeminiSSE } from "./translate.js"
 
 const GOOGLE_API_HOST = "daily-cloudcode-pa.googleapis.com"
 const MITM_PORT = 443  // LS connects to port 443 by default
 
-// ─── Self-signed certificate generation ──────────────────────────────────────
+// ─── Self-signed certificate generation (pure JS, no openssl) ────────────────
 
 interface CertPaths {
   certPath: string
@@ -36,40 +36,27 @@ function generateCert(dir: string): CertPaths {
   const combinedCaPath = join(dir, "mitm-combined-ca.pem")
 
   if (!existsSync(certPath)) {
-    // Generate self-signed cert for the Google domain
-    execSync(
-      `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 ` +
-      `-keyout "${keyPath}" -out "${certPath}" -days 365 -nodes ` +
-      `-subj "/CN=${GOOGLE_API_HOST}" ` +
-      `-addext "subjectAltName=DNS:${GOOGLE_API_HOST}"`,
-      { stdio: "pipe" }
+    const pems = (selfsigned as any).generate(
+      [{ name: "commonName", value: GOOGLE_API_HOST }],
+      {
+        days: 365,
+        keySize: 2048,
+        extensions: [
+          { name: "subjectAltName", altNames: [{ type: 2 /* DNS */, value: GOOGLE_API_HOST }] },
+        ],
+      },
     )
+    writeFileSync(certPath, pems.cert, "utf8")
+    writeFileSync(keyPath, pems.private, "utf8")
     console.log(`[MITM] Generated self-signed cert at ${certPath}`)
   }
 
-  // Build combined CA file: system roots + our cert
+  // Build combined CA file: Node's built-in root certs + our MITM cert
   if (!existsSync(combinedCaPath)) {
-    try {
-      // macOS: export system root CAs
-      const systemRoots = execSync(
-        `security export -t certs -f pemseq -k /System/Library/Keychains/SystemRootCertificates.keychain`,
-        { stdio: ["pipe", "pipe", "pipe"], maxBuffer: 10 * 1024 * 1024 }
-      )
-      const mitmCert = readFileSync(certPath, "utf8")
-      writeFileSync(combinedCaPath, systemRoots.toString() + "\n" + mitmCert)
-      console.log(`[MITM] Combined CA written to ${combinedCaPath}`)
-    } catch (e) {
-      // Linux fallback: try /etc/ssl/certs/ca-certificates.crt
-      try {
-        const systemRoots = readFileSync("/etc/ssl/certs/ca-certificates.crt", "utf8")
-        const mitmCert = readFileSync(certPath, "utf8")
-        writeFileSync(combinedCaPath, systemRoots + "\n" + mitmCert)
-      } catch {
-        // Just use our cert alone — some requests may fail
-        const mitmCert = readFileSync(certPath, "utf8")
-        writeFileSync(combinedCaPath, mitmCert)
-      }
-    }
+    const nodeRoots = rootCertificates.join("\n")
+    const mitmCert = readFileSync(certPath, "utf8")
+    writeFileSync(combinedCaPath, nodeRoots + "\n" + mitmCert)
+    console.log(`[MITM] Combined CA written to ${combinedCaPath}`)
   }
 
   return { certPath, keyPath, combinedCaPath }
@@ -77,16 +64,17 @@ function generateCert(dir: string): CertPaths {
 
 // ─── Resolve real Google IP ──────────────────────────────────────────────────
 
-function resolveGoogleIP(): string {
-  try {
-    const result = execSync(`dig +short ${GOOGLE_API_HOST} | head -1`, {
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 5000,
-    }).toString().trim()
-    if (/^\d+\.\d+\.\d+\.\d+$/.test(result)) return result
-  } catch { /* fall through */ }
-  // Fallback: well-known Google IP
-  return "142.250.80.95"
+function resolveGoogleIP(): Promise<string> {
+  return new Promise((resolve) => {
+    resolve4(GOOGLE_API_HOST, (err, addresses) => {
+      if (err || !addresses?.length) {
+        console.warn(`[MITM] DNS resolve failed, using fallback IP`)
+        resolve("142.250.80.95")
+      } else {
+        resolve(addresses[0])
+      }
+    })
+  })
 }
 
 // ─── Request body modification ───────────────────────────────────────────────
@@ -248,10 +236,10 @@ export interface MitmProxy {
   close(): void
 }
 
-export function startMitmProxy(store: MitmStore, dataDir: string): MitmProxy {
+export async function startMitmProxy(store: MitmStore, dataDir: string): Promise<MitmProxy> {
   const certDir = join(dataDir, "certs")
   const certPaths = generateCert(certDir)
-  const googleIP = resolveGoogleIP()
+  const googleIP = await resolveGoogleIP()
   console.log(`[MITM] Google API resolved to ${googleIP}`)
 
   let reqCounter = 0

@@ -3,9 +3,9 @@
  * agcc — Antigravity-to-Claude CLI
  *
  * Usage:
- *   agcc                              # start server (auto-reads ~/.agcc/token.json)
- *   agcc get-token                    # run OAuth flow, save to ~/.agcc/token.json
- *   agcc --refresh-token "1//0gXXX"   # start server with explicit token
+ *   agcc                              # start server (auto-login if needed)
+ *   agcc start                        # same as above
+ *   agcc --refresh-token "1//0gXXX"   # start with explicit token
  */
 
 import { join, dirname } from "path"
@@ -119,18 +119,15 @@ async function getToken(): Promise<string> {
 
 // ─── Parse args ──────────────────────────────────────────────────────────────
 
-function parseArgs(): { subcommand: string | null; refreshToken: string; port: number } {
+function parseArgs(): { refreshToken: string; port: number } {
   const args = process.argv.slice(2)
   let refreshToken = process.env.REFRESH_TOKEN ?? ""
   let port = parseInt(process.env.PORT ?? "8080", 10)
-  let subcommand: string | null = null
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
-      case "get-token":
-      case "login":
-        subcommand = "get-token"
-        break
+      case "start":
+        break // default command, no-op
       case "--refresh-token":
       case "--token":
         refreshToken = args[++i] ?? ""
@@ -145,37 +142,27 @@ function parseArgs(): { subcommand: string | null; refreshToken: string; port: n
 agcc — Antigravity-to-Claude
 
 Exposes Anthropic Messages API backed by Antigravity LS binary.
+Automatic OAuth login on first run, token saved to ~/.agcc/token.json.
 
 Usage:
-  agcc                              Start server (reads ~/.agcc/token.json)
-  agcc get-token                    Run OAuth flow and save refresh token
-  agcc login                        Alias for get-token
+  agcc [start] [options]
 
 Options:
   --refresh-token <token>  Override refresh token (or REFRESH_TOKEN env)
   --port, -p <port>        HTTP server port (default: 8080)
   --help, -h               Show this help
-
-Token storage:
-  ~/.agcc/token.json       Saved after get-token / login
 `)
         process.exit(0)
     }
   }
 
-  return { subcommand, refreshToken, port }
+  return { refreshToken, port }
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const { subcommand, refreshToken: explicitToken, port } = parseArgs()
-
-  // Subcommand: get-token
-  if (subcommand === "get-token") {
-    await getToken()
-    process.exit(0)
-  }
+  const { refreshToken: explicitToken, port } = parseArgs()
 
   // Resolve refresh token: explicit > env > saved > interactive OAuth
   let refreshToken = explicitToken
@@ -199,7 +186,7 @@ async function main() {
   const store = new MitmStore()
 
   // 2. MITM TLS proxy
-  const mitm = startMitmProxy(store, dataDir)
+  const mitm = await startMitmProxy(store, dataDir)
 
   // 3. Backend
   const backend = new Backend({
