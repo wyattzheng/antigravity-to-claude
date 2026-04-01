@@ -2,32 +2,135 @@
 /**
  * agcc — Antigravity-to-Claude CLI
  *
- * Starts a standalone HTTP server exposing Anthropic Messages API,
- * backed by the Antigravity LS binary + MITM TLS proxy.
- *
  * Usage:
- *   agcc --refresh-token "1//0gXXX..."
- *   REFRESH_TOKEN="1//0gXXX..." agcc
+ *   agcc                              # start server (auto-reads ~/.agcc/token.json)
+ *   agcc get-token                    # run OAuth flow, save to ~/.agcc/token.json
+ *   agcc --refresh-token "1//0gXXX"   # start server with explicit token
  */
 
 import { join, dirname } from "path"
 import { fileURLToPath } from "url"
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs"
+import { homedir } from "os"
 import { Backend } from "../src/backend.js"
 import { MitmStore } from "../src/store.js"
 import { startMitmProxy } from "../src/mitm.js"
 import { startLlmServer } from "../src/server.js"
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
+const AGCC_DIR = join(homedir(), ".agcc")
+const TOKEN_PATH = join(AGCC_DIR, "token.json")
+
+// ─── Token persistence ──────────────────────────────────────────────────────
+
+function loadSavedToken(): string | null {
+  try {
+    const data = JSON.parse(readFileSync(TOKEN_PATH, "utf-8"))
+    if (data.refresh_token) return data.refresh_token
+  } catch { /* not found or parse error */ }
+  return null
+}
+
+function saveToken(refreshToken: string): void {
+  mkdirSync(AGCC_DIR, { recursive: true })
+  writeFileSync(TOKEN_PATH, JSON.stringify({ refresh_token: refreshToken }, null, 2), "utf-8")
+  console.log(`\n✅ Token saved to ${TOKEN_PATH}`)
+}
+
+// ─── get-token OAuth flow ────────────────────────────────────────────────────
+
+const CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+const CLIENT_SECRET = "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"
+const SCOPES = "openid email profile https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/experimentsandconfigs"
+const OAUTH_PORT = 19877
+const REDIRECT_URI = `http://localhost:${OAUTH_PORT}/oauth-callback`
+
+async function getToken(): Promise<string> {
+  const http = await import("http")
+  const https = await import("https")
+  const { execSync } = await import("child_process")
+
+  console.log("═".repeat(50))
+  console.log("  🔐 agcc — Google OAuth Login")
+  console.log("═".repeat(50))
+
+  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${new URLSearchParams({
+    client_id: CLIENT_ID,
+    redirect_uri: REDIRECT_URI,
+    response_type: "code",
+    scope: SCOPES,
+    access_type: "offline",
+    prompt: "consent",
+  })}`
+
+  const code = await new Promise<string>((resolve) => {
+    const srv = http.createServer((req, res) => {
+      const u = new URL(req.url!, `http://localhost:${OAUTH_PORT}`)
+      if (u.pathname === "/oauth-callback" && u.searchParams.get("code")) {
+        res.writeHead(200, { "Content-Type": "text/html" })
+        res.end("<h1>✅ Done! Return to terminal.</h1><script>window.close()</script>")
+        srv.close()
+        resolve(u.searchParams.get("code")!)
+      }
+    })
+    srv.listen(OAUTH_PORT, () => {
+      console.log("\n🌐 Opening browser for Google OAuth...")
+      console.log("   (If browser doesn't open, visit this URL manually)\n")
+      try { execSync(`open "${authUrl}"`) } catch { console.log(authUrl) }
+    })
+  })
+
+  console.log("\n📡 Exchanging code for tokens...")
+
+  const tokens: any = await new Promise((resolve, reject) => {
+    const params = new URLSearchParams({
+      code,
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      redirect_uri: REDIRECT_URI,
+      grant_type: "authorization_code",
+    })
+    const req = https.request("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    }, (res) => {
+      let d = ""
+      res.on("data", (c: Buffer) => (d += c))
+      res.on("end", () => { try { resolve(JSON.parse(d)) } catch { reject(new Error(d)) } })
+    })
+    req.on("error", reject)
+    req.write(params.toString())
+    req.end()
+  })
+
+  if (tokens.error) {
+    throw new Error(`OAuth error: ${tokens.error_description || tokens.error}`)
+  }
+  if (!tokens.refresh_token) {
+    throw new Error(
+      "No refresh_token received. " +
+      "Try revoking access at https://myaccount.google.com/permissions and trying again."
+    )
+  }
+
+  saveToken(tokens.refresh_token)
+  return tokens.refresh_token
+}
 
 // ─── Parse args ──────────────────────────────────────────────────────────────
 
-function parseArgs(): { refreshToken: string; port: number } {
+function parseArgs(): { subcommand: string | null; refreshToken: string; port: number } {
   const args = process.argv.slice(2)
   let refreshToken = process.env.REFRESH_TOKEN ?? ""
   let port = parseInt(process.env.PORT ?? "8080", 10)
+  let subcommand: string | null = null
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
+      case "get-token":
+      case "login":
+        subcommand = "get-token"
+        break
       case "--refresh-token":
       case "--token":
         refreshToken = args[++i] ?? ""
@@ -44,29 +147,47 @@ agcc — Antigravity-to-Claude
 Exposes Anthropic Messages API backed by Antigravity LS binary.
 
 Usage:
-  agcc [options]
+  agcc                              Start server (reads ~/.agcc/token.json)
+  agcc get-token                    Run OAuth flow and save refresh token
+  agcc login                        Alias for get-token
 
 Options:
-  --refresh-token <token>  Google OAuth refresh token (or REFRESH_TOKEN env)
+  --refresh-token <token>  Override refresh token (or REFRESH_TOKEN env)
   --port, -p <port>        HTTP server port (default: 8080)
   --help, -h               Show this help
+
+Token storage:
+  ~/.agcc/token.json       Saved after get-token / login
 `)
         process.exit(0)
     }
   }
 
-  if (!refreshToken) {
-    console.error("Error: refresh token required. Use --refresh-token or set REFRESH_TOKEN env.")
-    process.exit(1)
-  }
-
-  return { refreshToken, port }
+  return { subcommand, refreshToken, port }
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const { refreshToken, port } = parseArgs()
+  const { subcommand, refreshToken: explicitToken, port } = parseArgs()
+
+  // Subcommand: get-token
+  if (subcommand === "get-token") {
+    await getToken()
+    process.exit(0)
+  }
+
+  // Resolve refresh token: explicit > env > saved > interactive OAuth
+  let refreshToken = explicitToken
+  if (!refreshToken) {
+    refreshToken = loadSavedToken() ?? ""
+  }
+  if (!refreshToken) {
+    console.log("No token found. Starting OAuth login flow...\n")
+    refreshToken = await getToken()
+    console.log("")
+  }
+
   const dataDir = join(__dirname, "..", ".data")
   const dylibPath = join(__dirname, "..", "native", "dns_redirect.dylib")
 
@@ -77,10 +198,10 @@ async function main() {
   // 1. MITM store
   const store = new MitmStore()
 
-  // 2. MITM TLS proxy (generates certs, resolves Google IP)
+  // 2. MITM TLS proxy
   const mitm = startMitmProxy(store, dataDir)
 
-  // 3. Backend (LS binary lifecycle)
+  // 3. Backend
   const backend = new Backend({
     refreshToken,
     dylibPath,
@@ -96,7 +217,6 @@ async function main() {
   console.log(`  ✅ Ready — http://localhost:${server.port}/v1/messages`)
   console.log("")
 
-  // Graceful shutdown
   const shutdown = () => {
     console.log("\n[Shutdown] Stopping...")
     server.close()
