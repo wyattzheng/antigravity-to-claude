@@ -1,10 +1,14 @@
 {
-  "name": "antigravity-to-claude",
+  "name": "agcc",
   "version": "0.1.0",
   "type": "module",
   "bin": {
     "agcc": "./dist/cli.js"
   },
+  "files": [
+    "dist/",
+    "bin/language_server_*"
+  ],
   "scripts": {
     "build": "tsup",
     "start": "pnpm build && node dist/cli.js",

@@ -4,3 +4,5 @@ dist/
 native/*.dylib
 *.dylib
 # bin/language_server_* — tracked via Git LFS (see .gitattributes)
+package-lock.json
+.npmrc
