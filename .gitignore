@@ -8,3 +8,4 @@ package-lock.json
 .npmrc
 server.log
 test.sh
+.npmrc.publish
