@@ -1,12 +1,17 @@
 /*
- * DNS redirect preload library for headless MITM interception.
+ * DNS redirect + TLS trust bypass preload library for MITM interception.
  *
- * Hooks getaddrinfo() via DYLD_INSERT_LIBRARIES (macOS) or LD_PRELOAD (Linux)
- * to redirect Google API domain resolution to 127.0.0.1, so the LS binary
- * connects to our local MITM proxy instead of the real Google servers.
+ * Two hooks:
+ *   1. getaddrinfo() — redirect Google API domains to 127.0.0.1
+ *   2. SecTrustEvaluateWithError() — bypass macOS cert verification
+ *      (only affects the injected process, not system-wide)
  *
- * Build (macOS): cc -shared -fPIC -o dns_redirect.dylib dns_redirect.c
- * Build (Linux): gcc -shared -fPIC -o dns_redirect.so dns_redirect.c -ldl
+ * Build (macOS):
+ *   cc -shared -fPIC -o dns_redirect.dylib dns_redirect.c \
+ *      -framework Security -framework CoreFoundation
+ *
+ * Build (Linux):
+ *   gcc -shared -fPIC -o dns_redirect.so dns_redirect.c -ldl
  */
 
 #include <dlfcn.h>
@@ -49,3 +54,26 @@ int getaddrinfo(const char *node, const char *service,
 
     return real_getaddrinfo(node, service, hints, res);
 }
+
+/*
+ * macOS only: hook Security.framework cert verification.
+ * Go's crypto/x509 on macOS calls SecTrustEvaluateWithError() via cgo
+ * to verify TLS certificates. By overriding it, we make the Go binary
+ * accept our self-signed MITM cert without touching the system keychain.
+ */
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#include <Security/Security.h>
+
+/* Override SecTrustEvaluateWithError — always return true (trusted) */
+bool SecTrustEvaluateWithError(SecTrustRef trust, CFErrorRef *error) {
+    if (error) *error = NULL;
+    return true;
+}
+
+/* Override the older SecTrustEvaluate too, for compatibility */
+OSStatus SecTrustEvaluate(SecTrustRef trust, SecTrustResultType *result) {
+    if (result) *result = kSecTrustResultProceed;
+    return errSecSuccess;
+}
+#endif

@@ -68,6 +68,7 @@ export class MitmStore {
     if (cascadeId && this.requests.has(cascadeId)) {
       const ctx = this.requests.get(cascadeId)!
       this.requests.delete(cascadeId)
+      if (this.latest === ctx) this.latest = null
       return ctx
     }
     // Fallback: take the latest registered request

@@ -13,7 +13,7 @@
 import { createServer as createHttpServer, type Server as HttpServer } from "http"
 import { request as httpsRequest } from "https"
 import { createServer as createNetServer } from "net"
-import { spawn, type ChildProcess } from "child_process"
+import { spawn, execSync, type ChildProcess } from "child_process"
 import { tmpdir, platform, homedir } from "os"
 import { join, dirname } from "path"
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs"
@@ -32,8 +32,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 
 const CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
 const CLIENT_SECRET = "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"
-const ANYCODE_DIR = join(homedir(), ".anycode")
-const TOKEN_CACHE_PATH = join(ANYCODE_DIR, "oauth_token.json")
+const AGCC_DIR = join(homedir(), ".agcc")
+const TOKEN_CACHE_PATH = join(AGCC_DIR, "oauth_token.json")
 
 // ─── Binary resolution ───────────────────────────────────────────────────────
 
@@ -60,6 +60,8 @@ export interface BackendOptions {
   dylibPath?: string
   /** Path to combined CA file for SSL_CERT_FILE */
   sslCertFile?: string
+  /** MITM proxy port (LS will connect to this port) */
+  mitmPort?: number
 }
 
 export class Backend {
@@ -75,11 +77,13 @@ export class Backend {
   private sslCertFile?: string
   private oauthResolve: (() => void) | null = null
   private oauthPromise: Promise<void> | null = null
+  private mitmPort: number
 
   constructor(opts: BackendOptions) {
     this.refreshToken = opts.refreshToken
     this.dylibPath = opts.dylibPath
     this.sslCertFile = opts.sslCertFile
+    this.mitmPort = opts.mitmPort ?? 18443
   }
 
   /** Initialize: refresh token → start ext server → spawn binary → inject OAuth */
@@ -117,7 +121,7 @@ export class Backend {
     return res.cascadeId
   }
 
-  /** Send a message on a cascade (used to trigger streamGenerateContent) */
+  /** Send a message on a cascade to trigger streamGenerateContent */
   async sendMessage(cascadeId: string, text: string): Promise<void> {
     const plannerConfig = {
       conversational: {
@@ -143,6 +147,7 @@ export class Backend {
       },
     }
 
+    // Same pattern as any-code: await the RPC
     await this.rpc("SendUserCascadeMessage", {
       cascadeId,
       items: [{ text }],
@@ -164,10 +169,11 @@ export class Backend {
   // ─── Internal ──────────────────────────────────────────────────────────────
 
   private async refreshAccessToken(): Promise<void> {
-    // Try cache first
+    // Try cache first — but only if same account (refresh_token matches)
     try {
       const cached = JSON.parse(readFileSync(TOKEN_CACHE_PATH, "utf-8"))
-      if (cached.access_token && cached.expires_at && Date.now() < cached.expires_at - 60_000) {
+      if (cached.access_token && cached.expires_at && Date.now() < cached.expires_at - 60_000
+          && cached.refresh_token === this.refreshToken) {
         this.accessToken = cached.access_token
         console.log("[Backend] ✅ Using cached access token")
         return
@@ -196,9 +202,10 @@ export class Backend {
             }
             this.accessToken = json.access_token
             try {
-              mkdirSync(ANYCODE_DIR, { recursive: true })
+              mkdirSync(AGCC_DIR, { recursive: true })
               writeFileSync(TOKEN_CACHE_PATH, JSON.stringify({
                 access_token: json.access_token,
+                refresh_token: this.refreshToken,
                 expires_at: Date.now() + (json.expires_in || 3600) * 1000,
               }), "utf-8")
             } catch { /* ignore cache write errors */ }
@@ -258,7 +265,28 @@ export class Backend {
     })
   }
 
+  /**
+   * Strip hardened runtime from Go binary on macOS so DYLD_INSERT_LIBRARIES works.
+   * No-op if already stripped or not on macOS.
+   */
+  private stripHardenedRuntime(binaryPath: string): void {
+    if (platform() !== "darwin") return
+    try {
+      const info = execSync(`codesign -dvv "${binaryPath}" 2>&1`, { encoding: "utf8" })
+      if (!info.includes("runtime")) return // already no hardened runtime
+      console.log("[Backend] Stripping hardened runtime from binary...")
+      execSync(`codesign --remove-signature "${binaryPath}"`, { stdio: "ignore" })
+      execSync(`codesign -s - "${binaryPath}"`, { stdio: "ignore" })
+      console.log("[Backend] ✅ Re-signed without hardened runtime")
+    } catch (e: any) {
+      console.log(`[Backend] ⚠ codesign strip failed: ${e.message}`)
+    }
+  }
+
   private spawnBinary(extPort: number, binaryPath: string): Promise<void> {
+    // Strip hardened runtime before spawn (macOS only, one-time)
+    this.stripHardenedRuntime(binaryPath)
+
     return new Promise((resolve, reject) => {
       const pipePath = join(tmpdir(), `agcc_${randomBytes(4).toString("hex")}`)
       const pipeServer = createNetServer(() => { })
@@ -268,19 +296,8 @@ export class Backend {
 
         const childEnv: Record<string, string> = { ...(process.env as any) }
 
-        // DNS redirect via dylib injection (replaces /etc/hosts)
-        if (this.dylibPath && existsSync(this.dylibPath)) {
-          childEnv.DYLD_INSERT_LIBRARIES = this.dylibPath
-          console.log(`[Backend] DNS redirect: ${this.dylibPath}`)
-        }
-
-        // SSL cert for MITM
-        if (this.sslCertFile) {
-          childEnv.SSL_CERT_FILE = this.sslCertFile
-          childEnv.SSL_CERT_DIR = "/dev/null"
-        }
-
-        const endpoint = "https://daily-cloudcode-pa.googleapis.com"
+        // Plain HTTP endpoint → no TLS, no certs, no DNS redirect needed
+        const endpoint = `http://127.0.0.1:${this.mitmPort}`
 
         const child = spawn(binaryPath, [
           "--csrf_token", this.lsCsrf,
@@ -330,7 +347,7 @@ export class Backend {
   private rpc(method: string, body: any = {}): Promise<any> {
     return new Promise((resolve, reject) => {
       const data = JSON.stringify(body)
-      const timeout = setTimeout(() => { req.destroy(); reject(new Error(`RPC ${method} timed out`)) }, 30000)
+      const timeout = setTimeout(() => { req.destroy(); reject(new Error(`RPC ${method} timed out`)) }, 120000)
       const req = httpsRequest({
         hostname: "127.0.0.1",
         port: this.lsPort,

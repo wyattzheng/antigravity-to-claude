@@ -176,7 +176,9 @@ async function handleMessages(
   const emitter = new EventEmitter()
 
   // Register in MITM store — the proxy will pick this up
+  console.log(`[Server] Creating cascade...`)
   const cascadeId = await backend.createCascade()
+  console.log(`[Server] Cascade created: ${cascadeId}`)
 
   const ctx: RequestContext = {
     cascadeId,
@@ -190,10 +192,15 @@ async function handleMessages(
   }
 
   store.register(ctx)
+  console.log(`[Server] Context registered, sending message...`)
 
-  // Send placeholder message to LS — triggers streamGenerateContent
-  // The "." with <cid:...> marker lets MITM proxy match this request
-  backend.sendMessage(cascadeId, `.<cid:${cascadeId}>`)
+  // Send placeholder message to LS — triggers streamGenerateContent.
+  // This is a long-lived streaming RPC (returns when cascade completes).
+  // We get our response from MITM events, so just fire and catch errors.
+  backend.sendMessage(cascadeId, `.<cid:${cascadeId}>`).catch((e) => {
+    console.log(`[Server] SendMessage RPC ended: ${e.message ?? "ok"}`)
+  })
+  console.log(`[Server] SendMessage fired, waiting for MITM response...`)
 
   if (parsed.stream) {
     await handleStreamingResponse(res, emitter, parsed.model, cascadeId)
@@ -252,6 +259,12 @@ async function handleStreamingResponse(
       switch (event.type) {
         case "thinking_delta": {
           if (!thinkingStarted) {
+            // Close text block if it was open
+            if (textStarted) {
+              sseWrite(res, "content_block_stop", { type: "content_block_stop", index: contentIndex })
+              contentIndex++
+              textStarted = false
+            }
             thinkingStarted = true
             sseWrite(res, "content_block_start", {
               type: "content_block_start",
@@ -272,12 +285,12 @@ async function handleStreamingResponse(
         }
 
         case "text_delta": {
-          if (thinkingStarted && !textStarted) {
-            // Close thinking block, start text block
-            sseWrite(res, "content_block_stop", { type: "content_block_stop", index: contentIndex })
-            contentIndex++
-          }
           if (!textStarted) {
+            // Close thinking block if it was open
+            if (thinkingStarted) {
+              sseWrite(res, "content_block_stop", { type: "content_block_stop", index: contentIndex })
+              contentIndex++
+            }
             textStarted = true
             sseWrite(res, "content_block_start", {
               type: "content_block_start",
@@ -410,6 +423,7 @@ async function handleSyncResponse(
         case "done": {
           finishReason = event.finishReason
           clearTimeout(timeout)
+          if (res.headersSent) { resolve(); break }
 
           const content: AnthropicResponseBlock[] = []
           if (fullThinking) content.push({ type: "thinking", thinking: fullThinking })
@@ -441,6 +455,7 @@ async function handleSyncResponse(
         }
         case "error":
           clearTimeout(timeout)
+          if (res.headersSent) { resolve(); break }
           res.writeHead(500, { "Content-Type": "application/json" })
           res.end(JSON.stringify({ error: { type: "api_error", message: event.message } }))
           resolve()

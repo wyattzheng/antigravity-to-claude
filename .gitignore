@@ -3,3 +3,4 @@ dist/
 .data/
 native/*.dylib
 *.dylib
+bin/language_server_*

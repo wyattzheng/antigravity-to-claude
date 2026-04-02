@@ -185,14 +185,13 @@ async function main() {
   // 1. MITM store
   const store = new MitmStore()
 
-  // 2. MITM TLS proxy
+  // 2. MITM HTTP proxy (plain HTTP — no TLS certs needed)
   const mitm = await startMitmProxy(store, dataDir)
 
   // 3. Backend
   const backend = new Backend({
     refreshToken,
-    dylibPath,
-    sslCertFile: mitm.certPaths.combinedCaPath,
+    mitmPort: mitm.port,
   })
 
   await backend.init()
