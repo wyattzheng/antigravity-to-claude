@@ -42,6 +42,10 @@ interface MessagesRequest {
 const MODEL_MAP: Record<string, number> = {
   "gemini-2.5-pro": 1026,
   "gemini-2.5-flash": 1027, // placeholder
+  "claude-sonnet-4-6": 1026,
+  "claude-opus-4-6": 1026,
+  "claude-opus-4-6[1m]": 1026,
+  "claude-haiku-4-5-20251001": 1027,
 }
 
 function resolveModel(name: string): { planModel: number; displayName: string } | null {
@@ -85,17 +89,21 @@ export function startLlmServer(opts: LlmServerOptions): { port: number; close():
     }
 
     try {
-      if (req.method === "GET" && req.url === "/v1/models") {
+      // Log ALL incoming requests for debugging
+      console.log(`[Server] ${req.method} ${req.url}`)
+
+      if (req.method === "GET" && req.url?.startsWith("/v1/models")) {
         return handleModels(res)
       }
-      if (req.method === "POST" && req.url === "/v1/messages") {
+      if (req.method === "POST" && req.url?.startsWith("/v1/messages")) {
         return await handleMessages(req, res, backend, store)
       }
-      if (req.method === "GET" && req.url === "/health") {
+      if (req.method === "GET" && (req.url === "/health" || req.url === "/")) {
         res.writeHead(200, { "Content-Type": "application/json" })
         res.end(JSON.stringify({ status: "ok" }))
         return
       }
+      console.log(`[Server] 404: ${req.method} ${req.url}`)
       res.writeHead(404, { "Content-Type": "application/json" })
       res.end(JSON.stringify({ error: { type: "not_found_error", message: "Not found" } }))
     } catch (e) {
@@ -117,13 +125,19 @@ export function startLlmServer(opts: LlmServerOptions): { port: number; close():
 // ─── GET /v1/models ──────────────────────────────────────────────────────────
 
 function handleModels(res: ServerResponse): void {
+  // Return Claude-style model names so Claude Code's client-side validation passes
+  const claudeModels = [
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+  ]
   res.writeHead(200, { "Content-Type": "application/json" })
   res.end(JSON.stringify({
-    data: Object.keys(MODEL_MAP).map(name => ({
+    data: claudeModels.map(name => ({
       id: name,
       object: "model",
       created: Math.floor(Date.now() / 1000),
-      owned_by: "google",
+      owned_by: "anthropic",
     })),
   }))
 }
@@ -285,11 +299,15 @@ async function handleStreamingResponse(
         }
 
         case "text_delta": {
+          const delta = event.text.substring(lastTextLen)
+          if (!delta) break // No new content — don't open a block yet
+
           if (!textStarted) {
             // Close thinking block if it was open
             if (thinkingStarted) {
               sseWrite(res, "content_block_stop", { type: "content_block_stop", index: contentIndex })
               contentIndex++
+              thinkingStarted = false
             }
             textStarted = true
             sseWrite(res, "content_block_start", {
@@ -298,15 +316,12 @@ async function handleStreamingResponse(
               content_block: { type: "text", text: "" },
             })
           }
-          const delta = event.text.substring(lastTextLen)
-          if (delta) {
-            sseWrite(res, "content_block_delta", {
-              type: "content_block_delta",
-              index: contentIndex,
-              delta: { type: "text_delta", text: delta },
-            })
-            lastTextLen = event.text.length
-          }
+          sseWrite(res, "content_block_delta", {
+            type: "content_block_delta",
+            index: contentIndex,
+            delta: { type: "text_delta", text: delta },
+          })
+          lastTextLen = event.text.length
           break
         }
 

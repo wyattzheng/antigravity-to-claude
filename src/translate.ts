@@ -63,7 +63,7 @@ export function anthropicMessagesToGemini(messages: AnthropicMessage[]): GeminiC
             break
           case "tool_use":
             parts.push({
-              functionCall: { name: block.name, args: block.input },
+              functionCall: { name: block.name, args: block.input, id: block.id },
             })
             break
           case "tool_result": {
@@ -78,6 +78,7 @@ export function anthropicMessagesToGemini(messages: AnthropicMessage[]): GeminiC
               functionResponse: {
                 name: toolName,
                 response: { result: resultText },
+                id: block.tool_use_id,
               },
             })
             break
@@ -143,9 +144,134 @@ export function anthropicToolsToGemini(
   const decls: GeminiFunctionDecl[] = tools.map(t => ({
     name: t.name,
     description: t.description,
-    parameters: t.input_schema,
+    parameters: sanitizeSchemaForGemini(t.input_schema),
   }))
   return [{ functionDeclarations: decls }]
+}
+
+/**
+ * Recursively translate JSON Schema to Gemini-compatible format.
+ * Gemini supports: type, description, enum, items, properties, required, nullable, format.
+ * We translate what we can, and only drop truly unsupported metadata.
+ */
+function sanitizeSchemaForGemini(schema: Record<string, unknown>): Record<string, unknown> {
+  // Gemini-supported keys (pass through directly)
+  const SUPPORTED_KEYS = new Set([
+    "type", "description", "enum", "items", "properties",
+    "required", "nullable", "format",
+    "minimum", "maximum", "minItems", "maxItems",
+    "minLength", "maxLength", "pattern",
+  ])
+
+  // Pure metadata — safe to drop
+  const DROP_KEYS = new Set([
+    "$schema", "$id", "$comment", "$ref", "$defs",
+    "contentMediaType", "contentEncoding",
+    "unevaluatedProperties", "unevaluatedItems",
+    "dependencies", "dependentRequired", "dependentSchemas",
+    "patternProperties", "propertyNames",
+    "if", "then", "else", "not",
+    "minContains", "maxContains", "prefixItems",
+    "readOnly", "writeOnly", "deprecated",
+  ])
+
+  const result: Record<string, unknown> = {}
+  const descParts: string[] = []
+
+  // Collect existing description
+  if (typeof schema.description === "string") {
+    descParts.push(schema.description)
+  }
+
+  // Translate `title` → prepend to description
+  if (typeof schema.title === "string" && schema.title !== schema.description) {
+    descParts.unshift(schema.title)
+  }
+
+  // Translate `default` → append to description
+  if (schema.default !== undefined) {
+    descParts.push(`Default: ${JSON.stringify(schema.default)}`)
+  }
+
+  // Translate `examples` → append to description
+  if (Array.isArray(schema.examples) && schema.examples.length > 0) {
+    descParts.push(`Examples: ${schema.examples.map(e => JSON.stringify(e)).join(", ")}`)
+  }
+
+  // Translate `const` → enum with single value
+  if (schema.const !== undefined) {
+    result.enum = [schema.const]
+  }
+
+  // Translate `anyOf` / `oneOf` → flatten (use first object-typed schema, or merge)
+  for (const key of ["anyOf", "oneOf"] as const) {
+    if (Array.isArray(schema[key])) {
+      const variants = schema[key] as Record<string, unknown>[]
+      // Filter out null-type variants (common pattern: {anyOf: [{type: "string"}, {type: "null"}]})
+      const nonNull = variants.filter(v => v.type !== "null")
+      const hasNull = variants.some(v => v.type === "null")
+      if (hasNull) result.nullable = true
+      if (nonNull.length === 1) {
+        // Simple nullable pattern — merge the non-null variant
+        const merged = sanitizeSchemaForGemini(nonNull[0])
+        Object.assign(result, merged)
+      } else if (nonNull.length > 1) {
+        // Multiple types — describe them, use the first
+        const merged = sanitizeSchemaForGemini(nonNull[0])
+        Object.assign(result, merged)
+        const typeNames = nonNull.map(v => String(v.type ?? "unknown")).join(" | ")
+        descParts.push(`(accepts: ${typeNames})`)
+      }
+    }
+  }
+
+  // Translate `allOf` → merge all schemas
+  if (Array.isArray(schema.allOf)) {
+    for (const sub of schema.allOf as Record<string, unknown>[]) {
+      const merged = sanitizeSchemaForGemini(sub)
+      Object.assign(result, merged)
+    }
+  }
+
+  // Translate `additionalProperties` → describe in description
+  if (schema.additionalProperties === false) {
+    // Just drop it — Gemini doesn't support it
+  } else if (typeof schema.additionalProperties === "object" && schema.additionalProperties !== null) {
+    descParts.push(`Additional properties schema: ${JSON.stringify(schema.additionalProperties)}`)
+  }
+
+  // Process supported keys
+  for (const [key, value] of Object.entries(schema)) {
+    if (DROP_KEYS.has(key)) continue
+    if (key === "description" || key === "title" || key === "default" || key === "examples" ||
+        key === "const" || key === "anyOf" || key === "oneOf" || key === "allOf" ||
+        key === "additionalProperties") continue // already handled
+    if (result[key] !== undefined) continue // already set by translation
+
+    if (key === "properties" && typeof value === "object" && value !== null) {
+      const sanitizedProps: Record<string, unknown> = {}
+      for (const [propName, propSchema] of Object.entries(value as Record<string, unknown>)) {
+        if (typeof propSchema === "object" && propSchema !== null) {
+          sanitizedProps[propName] = sanitizeSchemaForGemini(propSchema as Record<string, unknown>)
+        } else {
+          sanitizedProps[propName] = propSchema
+        }
+      }
+      result[key] = sanitizedProps
+    } else if (key === "items" && typeof value === "object" && value !== null) {
+      result[key] = sanitizeSchemaForGemini(value as Record<string, unknown>)
+    } else if (SUPPORTED_KEYS.has(key)) {
+      result[key] = value
+    }
+    // Unknown keys not in SUPPORTED or DROP → silently skip
+  }
+
+  // Set merged description
+  if (descParts.length > 0) {
+    result.description = descParts.join(". ")
+  }
+
+  return result
 }
 
 // ─── Tool Config ─────────────────────────────────────────────────────────────

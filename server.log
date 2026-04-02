@@ -1,0 +1,38 @@
+─────────────────────────────────────────────
+  agcc — Antigravity-to-Claude
+─────────────────────────────────────────────
+[MITM] Google API resolved to 74.125.68.95
+[Backend] Binary: /Users/zhenghuaiyu/antigravity-to-claude/bin/language_server_macos_arm
+[Backend] Refreshing access token...
+[Backend] ✅ Using cached access token
+[Backend] ✅ Access token obtained
+[MITM] HTTP proxy listening on 127.0.0.1:18443
+[Backend] ✅ Extension server on port 59910
+[Binary] I0403 02:34:28.937977  5841 server.go:1235] Starting language server process with pid 5841
+[Binary] I0403 02:34:28.938084  5841 server.go:288] Setting GOMAXPROCS to 4
+[Binary] I0403 02:34:28.938768  5841 server.go:440] Language server will attempt to listen on host 127.0.0.1
+[Binary] I0403 02:34:28.938841  5841 server.go:454] Language server listening on random port at 59911 for HTTPS (gRPC)
+[Binary] I0403 02:34:28.938857  5841 server.go:461] Language server listening on random port at 59912 for HTTP
+[Backend] ✅ Language server on port 59911
+[Backend] Waiting for OAuth injection...
+[Binary] I0403 02:34:30.136408  5841 server.go:433] Created extension server client at port 59910
+[Binary] I0403 02:34:30.149961  5841 cascade_manager.go:815] Reactive state is disabled
+[Binary] I0403 02:34:30.158423  5841 server.go:1691] initialized server successfully in 1.220298292s
+[Backend] ✅ OAuth token injected via USS
+
+  ✅ Ready — http://localhost:8080/v1/messages
+
+[Server] Anthropic-compatible API listening on http://localhost:8080
+[Server]   POST /v1/messages
+[Server]   GET  /v1/models
+[MITM] #1 pass-through: POST /v1internal:fetchUserInfo (2 bytes)
+[MITM] #2 pass-through: POST /v1internal:loadCodeAssist (38 bytes)
+[MITM] #1 pass-through response: 200 (91 bytes)
+[MITM] #2 pass-through response: 200 (1060 bytes)
+[Binary] I0403 02:34:30.934268  5841 http_helpers.go:123] URL: http://127.0.0.1:18443/v1internal:loadCodeAssist Trace: 0x293c19c8f8fba435
+[MITM] #3 pass-through: POST /v1internal:fetchAvailableModels (37 bytes)
+[MITM] #4 pass-through: POST /v1internal:fetchAdminControls (37 bytes)
+[MITM] #4 pass-through response: 200 (23 bytes)
+[MITM] #3 pass-through response: 200 (2107 bytes)
+[Binary] I0403 02:34:31.531779  5841 http_helpers.go:123] URL: http://127.0.0.1:18443/v1internal:fetchAvailableModels Trace: 0xbdb488361c5f8450
+[Binary] E0403 02:34:35.605507  5841 client.go:55] Clearcut responded with HTTP code401

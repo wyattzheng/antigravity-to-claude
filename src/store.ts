@@ -11,8 +11,8 @@ import { EventEmitter } from "events"
 
 export interface GeminiPart {
   text?: string
-  functionCall?: { name: string; args: Record<string, unknown> }
-  functionResponse?: { name: string; response: Record<string, unknown> }
+  functionCall?: { name: string; args: Record<string, unknown>; id?: string }
+  functionResponse?: { name: string; response: Record<string, unknown>; id?: string }
   inlineData?: { mimeType: string; data: string }
   thoughtSignature?: string
 }
