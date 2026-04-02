@@ -260,6 +260,7 @@ async function handleStreamingResponse(
   let lastTextLen = 0
   let thinkingStarted = false
   let textStarted = false
+  let thinkingSignature = ""
   let usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 }
 
   return new Promise<void>((resolve) => {
@@ -286,6 +287,7 @@ async function handleStreamingResponse(
               content_block: { type: "thinking", thinking: "" },
             })
           }
+          if (event.signature) thinkingSignature = event.signature
           const delta = event.text.substring(lastThinkingLen)
           if (delta) {
             sseWrite(res, "content_block_delta", {
@@ -303,8 +305,15 @@ async function handleStreamingResponse(
           if (!delta) break // No new content — don't open a block yet
 
           if (!textStarted) {
-            // Close thinking block if it was open
+            // Close thinking block if it was open — emit signature first
             if (thinkingStarted) {
+              if (thinkingSignature) {
+                sseWrite(res, "content_block_delta", {
+                  type: "content_block_delta",
+                  index: contentIndex,
+                  delta: { type: "signature_delta", signature: thinkingSignature },
+                })
+              }
               sseWrite(res, "content_block_stop", { type: "content_block_stop", index: contentIndex })
               contentIndex++
               thinkingStarted = false
@@ -327,10 +336,19 @@ async function handleStreamingResponse(
 
         case "function_call": {
           hasToolCalls = true
-          // Close any open text block
+          // Close any open text/thinking block
           if (textStarted || thinkingStarted) {
+            if (thinkingStarted && thinkingSignature) {
+              sseWrite(res, "content_block_delta", {
+                type: "content_block_delta",
+                index: contentIndex,
+                delta: { type: "signature_delta", signature: thinkingSignature },
+              })
+            }
             sseWrite(res, "content_block_stop", { type: "content_block_stop", index: contentIndex })
             contentIndex++
+            textStarted = false
+            thinkingStarted = false
           }
           // Emit each tool call as a content block
           for (const call of event.calls) {
@@ -343,7 +361,7 @@ async function handleStreamingResponse(
             sseWrite(res, "content_block_delta", {
               type: "content_block_delta",
               index: contentIndex,
-              delta: { type: "input_json_delta", partial_json: JSON.stringify(call.args) },
+              delta: { type: "input_json_delta", partial_json: JSON.stringify(call.args ?? {}) },
             })
             sseWrite(res, "content_block_stop", { type: "content_block_stop", index: contentIndex })
             contentIndex++
@@ -362,6 +380,13 @@ async function handleStreamingResponse(
         case "done": {
           // Close any open block
           if ((textStarted || thinkingStarted) && !hasToolCalls) {
+            if (thinkingStarted && thinkingSignature) {
+              sseWrite(res, "content_block_delta", {
+                type: "content_block_delta",
+                index: contentIndex,
+                delta: { type: "signature_delta", signature: thinkingSignature },
+              })
+            }
             sseWrite(res, "content_block_stop", { type: "content_block_stop", index: contentIndex })
           }
 
@@ -409,6 +434,7 @@ async function handleSyncResponse(
     const toolCalls: Array<{ name: string; args: Record<string, unknown> }> = []
     let usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 }
     let finishReason = "STOP"
+    let thinkingSignature = ""
 
     const timeout = setTimeout(() => {
       res.writeHead(500, { "Content-Type": "application/json" })
@@ -420,6 +446,7 @@ async function handleSyncResponse(
       switch (event.type) {
         case "thinking_delta":
           fullThinking = event.text
+          if (event.signature) thinkingSignature = event.signature
           break
         case "text_delta":
           fullText = event.text
@@ -441,14 +468,18 @@ async function handleSyncResponse(
           if (res.headersSent) { resolve(); break }
 
           const content: AnthropicResponseBlock[] = []
-          if (fullThinking) content.push({ type: "thinking", thinking: fullThinking })
+          if (fullThinking) {
+            const thinkingBlock: any = { type: "thinking", thinking: fullThinking }
+            if (thinkingSignature) thinkingBlock.signature = thinkingSignature
+            content.push(thinkingBlock)
+          }
           if (fullText) content.push({ type: "text", text: fullText })
           for (const call of toolCalls) {
             content.push({
               type: "tool_use",
               id: `toolu_${randomUUID().replace(/-/g, "").substring(0, 24)}`,
               name: call.name,
-              input: call.args,
+              input: call.args ?? {},
             })
           }
 

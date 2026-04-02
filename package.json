@@ -7,8 +7,7 @@
   },
   "scripts": {
     "build": "tsup",
-    "build:native": "cc -shared -fPIC -o native/dns_redirect.dylib native/dns_redirect.c",
-    "start": "node dist/cli.js",
+    "start": "pnpm build && node dist/cli.js",
     "test:e2e": "vitest run --config vitest.e2e.config.ts"
   },
   "devDependencies": {

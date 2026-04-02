@@ -10,8 +10,34 @@
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "http"
 import * as http2 from "http2"
 import { resolve4 } from "dns"
+import { mkdirSync, appendFileSync, statSync } from "fs"
+import { join } from "path"
+import { homedir } from "os"
 import { MitmStore, type RequestContext, type MitmEvent } from "./store.js"
 import { parseGeminiSSE } from "./translate.js"
+
+const LOG_DIR = join(homedir(), ".agcc", "logs")
+mkdirSync(LOG_DIR, { recursive: true })
+
+const LOG_FILE = join(LOG_DIR, "mitm.log")
+const MAX_LOG_SIZE = 10 * 1024 * 1024 // 10MB
+
+function writeLog(reqId: number, request: any, response: any): void {
+  try {
+    // Truncate if too large
+    try {
+      const stat = statSync(LOG_FILE)
+      if (stat.size > MAX_LOG_SIZE) {
+        appendFileSync(LOG_FILE, "", { flag: "w" })
+      }
+    } catch { /* file doesn't exist yet */ }
+
+    const entry = JSON.stringify({ ts: new Date().toISOString(), reqId, request, response })
+    appendFileSync(LOG_FILE, entry + "\n", "utf-8")
+  } catch (e: any) {
+    console.error(`[MITM] Failed to write log: ${e.message}`)
+  }
+}
 
 const GOOGLE_API_HOST = "daily-cloudcode-pa.googleapis.com"
 const MITM_PORT = 18443
@@ -100,137 +126,9 @@ function modifyRequest(body: Buffer, store: MitmStore): { modified: Buffer; ctx:
   return { modified, ctx }
 }
 
-// ─── Response SSE parsing and event emission ─────────────────────────────────
-
-function processResponseSSE(data: Buffer, ctx: RequestContext): void {
-  const text = data.toString()
-  console.log(`[MITM] Raw response (first 400): ${text.substring(0, 400)}`)
-  const lines = text.split("\n")
-
-  let accText = ""
-  let accThinking = ""
-  const functionCalls: Array<{ name: string; args: Record<string, unknown> }> = []
-  let finishReason = ""
-  let inputTokens = 0
-  let outputTokens = 0
-  let cacheReadTokens = 0
-  let thinkingTokens = 0
-
-  let parsedChunks = 0
-
-  for (const line of lines) {
-    const chunk = parseGeminiSSE(line)
-    if (!chunk) continue
-    parsedChunks++
-
-    // Unwrap Vertex AI response wrapper: {response: {candidates, usageMetadata}, traceId, metadata}
-    const inner = (chunk as any).response ?? chunk
-
-    // Usage metadata
-    if (inner.usageMetadata) {
-      inputTokens = inner.usageMetadata.promptTokenCount ?? 0
-      outputTokens = inner.usageMetadata.candidatesTokenCount ?? 0
-      cacheReadTokens = inner.usageMetadata.cachedContentTokenCount ?? 0
-      thinkingTokens = inner.usageMetadata.thoughtsTokenCount ?? 0
-    }
-
-    const candidate = inner.candidates?.[0]
-    if (!candidate) continue
-
-    if (candidate.finishReason) {
-      finishReason = candidate.finishReason
-    }
-
-    const parts = candidate.content?.parts
-    if (!parts) continue
-
-    for (const part of parts) {
-      if (part.text !== undefined) {
-        if (part.thoughtSignature !== undefined) {
-          // This is a thinking part (has thoughtSignature sibling in response)
-          accThinking += part.text
-          ctx.emitter.emit("event", { type: "thinking_delta", text: accThinking } satisfies MitmEvent)
-        } else {
-          accText += part.text
-          ctx.emitter.emit("event", { type: "text_delta", text: accText } satisfies MitmEvent)
-        }
-      }
-      if (part.functionCall) {
-        functionCalls.push({
-          name: part.functionCall.name,
-          args: part.functionCall.args,
-        })
-      }
-    }
-  }
-
-  // Emit final events
-  if (functionCalls.length > 0) {
-    ctx.emitter.emit("event", { type: "function_call", calls: functionCalls } satisfies MitmEvent)
-  }
-
-  ctx.emitter.emit("event", {
-    type: "usage",
-    inputTokens,
-    outputTokens,
-    cacheReadTokens,
-    thinkingTokens,
-  } satisfies MitmEvent)
-
-  console.log(`[MITM] SSE parsed: ${parsedChunks} chunks, text=${accText.length}b, thinking=${accThinking.length}b, tools=${functionCalls.length}`)
-  if (parsedChunks === 0) {
-    console.log(`[MITM] SSE raw (first 300): ${text.substring(0, 300)}`)
-  }
-
-  ctx.emitter.emit("event", {
-    type: "done",
-    finishReason: finishReason || "STOP",
-  } satisfies MitmEvent)
-}
-
-// ─── Strip function calls from SSE response ─────────────────────────────────
-
-function stripFunctionCalls(body: Buffer): Buffer {
-  const text = body.toString()
-  const lines = text.split("\n")
-  const outputLines: string[] = []
-
-  for (const line of lines) {
-    if (!line.startsWith("data: ")) {
-      outputLines.push(line)
-      continue
-    }
-
-    const jsonStr = line.substring(6).trim()
-    if (!jsonStr) { outputLines.push(line); continue }
-
-    try {
-      const chunk = JSON.parse(jsonStr)
-      // Unwrap Vertex AI response wrapper
-      const inner = chunk.response ?? chunk
-      // Strip functionCall parts from candidates
-      if (inner.candidates) {
-        for (const candidate of inner.candidates) {
-          if (candidate.content?.parts) {
-            candidate.content.parts = candidate.content.parts.filter(
-              (p: any) => !p.functionCall
-            )
-            if (candidate.content.parts.length === 0) {
-              candidate.content.parts = [{ text: "" }]
-            }
-          }
-        }
-      }
-      outputLines.push(`data: ${JSON.stringify(chunk)}`)
-    } catch {
-      outputLines.push(line)
-    }
-  }
-
-  return Buffer.from(outputLines.join("\n"))
-}
 
 // ─── MITM HTTP Proxy ─────────────────────────────────────────────────────────
+
 
 export interface MitmProxy {
   port: number
@@ -263,7 +161,6 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
 
       if (isGenerateContent) {
         console.log(`[MITM] #${reqId} streamGenerateContent (${body.length} bytes)`)
-
         const result = modifyRequest(body, store)
         if (!result.ctx) {
           console.log(`[MITM] #${reqId} No context, returning STOP`)
@@ -374,13 +271,17 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
         let accText = ""
         let accThinking = ""
         let totalBytes = 0
+        let rawSSE = ""  // accumulate full SSE for logging
         const functionCalls: Array<{ name: string; args: Record<string, unknown> }> = []
         let finishReason = ""
+        let thinkingSignature = ""
         let inputTokens = 0, outputTokens = 0, cacheReadTokens = 0, thinkingTokens = 0
 
         h2req.on("data", (chunk: Buffer) => {
           totalBytes += chunk.length
-          sseBuffer += chunk.toString()
+          const chunkStr = chunk.toString()
+          rawSSE += chunkStr
+          sseBuffer += chunkStr
 
           const parts = sseBuffer.split("\n")
           sseBuffer = parts.pop()!
@@ -406,7 +307,12 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
               if (part.text !== undefined) {
                 if ((part as any).thought === true) {
                   accThinking += part.text
-                  ctx.emitter.emit("event", { type: "thinking_delta", text: accThinking } satisfies MitmEvent)
+                  const sig = (part as any).thoughtSignature
+                  if (sig) thinkingSignature = sig
+                  ctx.emitter.emit("event", {
+                    type: "thinking_delta", text: accThinking,
+                    ...(thinkingSignature ? { signature: thinkingSignature } : {}),
+                  } satisfies MitmEvent)
                 } else {
                   accText += part.text
                   ctx.emitter.emit("event", { type: "text_delta", text: accText } satisfies MitmEvent)
@@ -421,6 +327,13 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
 
         h2req.on("end", () => {
           console.log(`[MITM] #${reqId} Done: ${totalBytes}B, text=${accText.length}b, thinking=${accThinking.length}b`)
+          // Log request/response (log the modified body actually sent to Google)
+          try {
+            const reqJson = JSON.parse(finalBody.toString())
+            writeLog(reqId, { method: reqMethod, path: reqPath, body: reqJson }, { status: statusCode, sse: rawSSE })
+          } catch {
+            writeLog(reqId, { method: reqMethod, path: reqPath, bodySize: finalBody.length }, { status: statusCode, sse: rawSSE })
+          }
           if (functionCalls.length > 0) {
             ctx.emitter.emit("event", { type: "function_call", calls: functionCalls } satisfies MitmEvent)
           }

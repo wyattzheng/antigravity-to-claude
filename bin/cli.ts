@@ -10,8 +10,9 @@
 
 import { join, dirname } from "path"
 import { fileURLToPath } from "url"
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs"
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from "fs"
 import { homedir } from "os"
+import { randomBytes } from "crypto"
 import { Backend } from "../src/backend.js"
 import { MitmStore } from "../src/store.js"
 import { startMitmProxy } from "../src/mitm.js"
@@ -35,6 +36,40 @@ function saveToken(refreshToken: string): void {
   mkdirSync(AGCC_DIR, { recursive: true })
   writeFileSync(TOKEN_PATH, JSON.stringify({ refresh_token: refreshToken }, null, 2), "utf-8")
   console.log(`\n✅ Token saved to ${TOKEN_PATH}`)
+}
+
+const OAUTH_CACHE_PATH = join(AGCC_DIR, "oauth_token.json")
+
+function clearTokens(): void {
+  for (const f of [TOKEN_PATH, OAUTH_CACHE_PATH]) {
+    try { unlinkSync(f) } catch { /* doesn't exist */ }
+  }
+  console.log("🗑  Cleared saved tokens")
+}
+
+// ─── set-cc: patch Claude Code settings ─────────────────────────────────────────
+
+const CLAUDE_SETTINGS_PATH = join(homedir(), ".claude", "settings.json")
+const DEFAULT_PORT = 19888
+
+function setCCConfig(port: number): void {
+  let settings: any = {}
+  try {
+    settings = JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, "utf-8"))
+  } catch { /* file doesn't exist or parse error, start fresh */ }
+
+  if (!settings.env) settings.env = {}
+  settings.env.ANTHROPIC_BASE_URL = `http://localhost:${port}`
+  // Generate a random dummy API key if none exists (Claude Code requires one)
+  if (!settings.env.ANTHROPIC_AUTH_TOKEN) {
+    settings.env.ANTHROPIC_AUTH_TOKEN = `sk-${randomBytes(32).toString("hex")}`
+  }
+
+  mkdirSync(dirname(CLAUDE_SETTINGS_PATH), { recursive: true })
+  writeFileSync(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2), "utf-8")
+  console.log(`✅ Claude Code configured:`)
+  console.log(`   ANTHROPIC_BASE_URL = http://localhost:${port}`)
+  console.log(`   Settings file: ${CLAUDE_SETTINGS_PATH}`)
 }
 
 // ─── get-token OAuth flow ────────────────────────────────────────────────────
@@ -67,8 +102,22 @@ async function getToken(): Promise<string> {
     const srv = http.createServer((req, res) => {
       const u = new URL(req.url!, `http://localhost:${OAUTH_PORT}`)
       if (u.pathname === "/oauth-callback" && u.searchParams.get("code")) {
-        res.writeHead(200, { "Content-Type": "text/html" })
-        res.end("<h1>✅ Done! Return to terminal.</h1><script>window.close()</script>")
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" })
+        res.end(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>AGCC</title>
+<style>
+*{margin:0;box-sizing:border-box}
+body{height:100vh;display:flex;align-items:center;justify-content:center;font-family:system-ui,-apple-system,sans-serif;background:#fafafa;color:#222}
+.c{text-align:center}
+.msg{font-size:1.5rem;font-weight:500;color:#333}
+.sub{margin-top:.75rem;font-size:.95rem;color:#999}
+</style></head>
+<body><div class="c">
+<div class="msg">Logged in successfully.</div>
+<div class="sub">You may close this tab.</div>
+</div>
+<script>setTimeout(()=>window.close(),1500)</script>
+</body></html>`)
         srv.close()
         resolve(u.searchParams.get("code")!)
       }
@@ -119,54 +168,78 @@ async function getToken(): Promise<string> {
 
 // ─── Parse args ──────────────────────────────────────────────────────────────
 
-function parseArgs(): { refreshToken: string; port: number } {
-  const args = process.argv.slice(2)
-  let refreshToken = process.env.REFRESH_TOKEN ?? ""
-  let port = parseInt(process.env.PORT ?? "8080", 10)
-
-  for (let i = 0; i < args.length; i++) {
-    switch (args[i]) {
-      case "start":
-        break // default command, no-op
-      case "--refresh-token":
-      case "--token":
-        refreshToken = args[++i] ?? ""
-        break
-      case "--port":
-      case "-p":
-        port = parseInt(args[++i] ?? "8080", 10)
-        break
-      case "--help":
-      case "-h":
-        console.log(`
+function showHelp(): void {
+  console.log(`
 agcc — Antigravity-to-Claude
 
 Exposes Anthropic Messages API backed by Antigravity LS binary.
 Automatic OAuth login on first run, token saved to ~/.agcc/token.json.
 
 Usage:
-  agcc [start] [options]
+  agcc start [options]          Start the server
+  agcc re-login [options]       Clear saved tokens and re-login
+  agcc set-cc [port]            Set Claude Code to use agcc (default: ${DEFAULT_PORT})
 
 Options:
   --refresh-token <token>  Override refresh token (or REFRESH_TOKEN env)
-  --port, -p <port>        HTTP server port (default: 8080)
+  --port, -p <port>        HTTP server port (default: ${DEFAULT_PORT})
   --help, -h               Show this help
 `)
+}
+
+function parseArgs(): { command: "start" | "re-login" | "help"; refreshToken: string; port: number } {
+  const args = process.argv.slice(2)
+  let refreshToken = process.env.REFRESH_TOKEN ?? ""
+  let port = parseInt(process.env.PORT ?? String(DEFAULT_PORT), 10)
+  let command: "start" | "re-login" | "help" = "help"
+
+  for (let i = 0; i < args.length; i++) {
+    switch (args[i]) {
+      case "start":
+        command = "start"
+        break
+      case "re-login":
+        command = "re-login"
+        break
+      case "set-cc":
+        setCCConfig(parseInt(args[++i] ?? String(DEFAULT_PORT), 10))
+        process.exit(0)
+      case "--refresh-token":
+      case "--token":
+        refreshToken = args[++i] ?? ""
+        break
+      case "--port":
+      case "-p":
+        port = parseInt(args[++i] ?? String(DEFAULT_PORT), 10)
+        break
+      case "--help":
+      case "-h":
+        showHelp()
         process.exit(0)
     }
   }
 
-  return { refreshToken, port }
+  return { command, refreshToken, port }
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const { refreshToken: explicitToken, port } = parseArgs()
+  const { command, refreshToken: explicitToken, port } = parseArgs()
+
+  if (command === "help") {
+    showHelp()
+    process.exit(0)
+  }
+
+  // relogin: clear everything and force OAuth
+  if (command === "re-login") {
+    clearTokens()
+  }
 
   // Resolve refresh token: explicit > env > saved > interactive OAuth
   let refreshToken = explicitToken
-  if (!refreshToken) {
+  if (!refreshToken && command !== "re-login") {
     refreshToken = loadSavedToken() ?? ""
   }
   if (!refreshToken) {
@@ -202,6 +275,21 @@ async function main() {
   console.log("")
   console.log(`  ✅ Ready — http://localhost:${server.port}/v1/messages`)
   console.log("")
+
+  // Hint: if Claude Code is installed but not configured for agcc
+  if (existsSync(join(homedir(), ".claude"))) {
+    let needsHint = false
+    try {
+      const s = JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, "utf-8"))
+      if (s?.env?.ANTHROPIC_BASE_URL !== `http://localhost:${server.port}`) needsHint = true
+    } catch {
+      needsHint = true
+    }
+    if (needsHint) {
+      console.log(`  💡 Claude Code detected. Run "agcc set-cc" to configure it automatically.`)
+      console.log("")
+    }
+  }
 
   const shutdown = () => {
     console.log("\n[Shutdown] Stopping...")

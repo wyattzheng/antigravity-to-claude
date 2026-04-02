@@ -47,9 +47,20 @@ function resolveBinaryPath(): string {
   if (!binaryName) throw new Error(`Unsupported platform: ${os}`)
 
   const bundled = join(__dirname, "..", "bin", binaryName)
-  if (existsSync(bundled)) return bundled
+  if (!existsSync(bundled)) throw new Error(`Go binary not found at ${bundled}`)
 
-  throw new Error(`Go binary not found at ${bundled}`)
+  // Detect Git LFS pointer (text file starting with "version https://git-lfs")
+  const head = readFileSync(bundled, { encoding: "utf8", flag: "r" }).slice(0, 50)
+  if (head.startsWith("version https://git-lfs")) {
+    const installHint = os === "darwin" ? "brew install git-lfs" : "apt-get install git-lfs"
+    throw new Error(
+      `Binary "${binaryName}" is a Git LFS pointer, not the actual file.\n` +
+      `  → Install git-lfs:  ${installHint}\n` +
+      `  → Then pull files:  git lfs pull`
+    )
+  }
+
+  return bundled
 }
 
 // ─── Backend ─────────────────────────────────────────────────────────────────

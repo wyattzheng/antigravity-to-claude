@@ -16,6 +16,7 @@ export interface AnthropicMessage {
 
 export type AnthropicContentBlock =
   | { type: "text"; text: string }
+  | { type: "thinking"; thinking: string }
   | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
   | { type: "tool_result"; tool_use_id: string; content: string | AnthropicContentBlock[] }
   | { type: "image"; source: { type: "base64"; media_type: string; data: string } }
@@ -59,8 +60,15 @@ export function anthropicMessagesToGemini(messages: AnthropicMessage[]): GeminiC
       for (const block of msg.content) {
         switch (block.type) {
           case "text":
-            parts.push({ text: block.text })
+            if (block.text) parts.push({ text: block.text })
             break
+          case "thinking": {
+            const tb = block as any
+            const part: any = { thought: true, text: tb.thinking ?? "" }
+            if (tb.signature) part.thoughtSignature = tb.signature
+            parts.push(part)
+            break
+          }
           case "tool_use":
             parts.push({
               functionCall: { name: block.name, args: block.input, id: block.id },
