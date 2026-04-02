@@ -353,10 +353,12 @@ async function handleStreamingResponse(
           // Emit each tool call as a content block
           for (const call of event.calls) {
             const toolId = `toolu_${randomUUID().replace(/-/g, "").substring(0, 24)}`
+            const block: Record<string, unknown> = { type: "tool_use", id: toolId, name: call.name, input: {} }
+            if (call.thoughtSignature) block.thought_signature = call.thoughtSignature
             sseWrite(res, "content_block_start", {
               type: "content_block_start",
               index: contentIndex,
-              content_block: { type: "tool_use", id: toolId, name: call.name, input: {} },
+              content_block: block,
             })
             sseWrite(res, "content_block_delta", {
               type: "content_block_delta",
@@ -431,7 +433,7 @@ async function handleSyncResponse(
     let fullText = ""
     let fullThinking = ""
     let hasToolCalls = false
-    const toolCalls: Array<{ name: string; args: Record<string, unknown> }> = []
+    const toolCalls: Array<{ name: string; args: Record<string, unknown>; thoughtSignature?: string }> = []
     let usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 }
     let finishReason = "STOP"
     let thinkingSignature = ""
@@ -475,12 +477,14 @@ async function handleSyncResponse(
           }
           if (fullText) content.push({ type: "text", text: fullText })
           for (const call of toolCalls) {
-            content.push({
+            const block: any = {
               type: "tool_use",
               id: `toolu_${randomUUID().replace(/-/g, "").substring(0, 24)}`,
               name: call.name,
               input: call.args ?? {},
-            })
+            }
+            if (call.thoughtSignature) block.thought_signature = call.thoughtSignature
+            content.push(block)
           }
 
           const stopReason = geminiStopReasonToAnthropic(finishReason, hasToolCalls)

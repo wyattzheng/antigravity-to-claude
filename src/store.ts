@@ -33,7 +33,7 @@ export interface GeminiFunctionDecl {
 export type MitmEvent =
   | { type: "thinking_delta"; text: string; signature?: string }
   | { type: "text_delta"; text: string }
-  | { type: "function_call"; calls: Array<{ name: string; args: Record<string, unknown> }> }
+  | { type: "function_call"; calls: Array<{ name: string; args: Record<string, unknown>; thoughtSignature?: string }> }
   | { type: "usage"; inputTokens: number; outputTokens: number; cacheReadTokens: number; thinkingTokens: number }
   | { type: "done"; finishReason: string }
   | { type: "error"; message: string }

@@ -69,11 +69,15 @@ export function anthropicMessagesToGemini(messages: AnthropicMessage[]): GeminiC
             parts.push(part)
             break
           }
-          case "tool_use":
-            parts.push({
+          case "tool_use": {
+            const part: GeminiPart = {
               functionCall: { name: block.name, args: block.input, id: block.id },
-            })
+            }
+            const sig = (block as any).thought_signature
+            if (sig) part.thoughtSignature = sig
+            parts.push(part)
             break
+          }
           case "tool_result": {
             const resultText = typeof block.content === "string"
               ? block.content

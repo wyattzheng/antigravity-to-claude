@@ -252,6 +252,13 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
           h2req.on("end", () => {
             const errBody = Buffer.concat(errChunks).toString()
             console.log(`[MITM] #${reqId} Error: ${errBody.substring(0, 500)}`)
+            // Log error responses too
+            try {
+              const reqJson = JSON.parse(finalBody.toString())
+              writeLog(reqId, { method: reqMethod, path: reqPath, body: reqJson }, { status: statusCode, error: errBody })
+            } catch {
+              writeLog(reqId, { method: reqMethod, path: reqPath, bodySize: finalBody.length }, { status: statusCode, error: errBody })
+            }
             ctx.emitter.emit("event", { type: "error", message: errBody.substring(0, 200) } satisfies MitmEvent)
             res.writeHead(200, { "Content-Type": "text/event-stream" })
             const fakeChunk = JSON.stringify({
@@ -272,7 +279,7 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
         let accThinking = ""
         let totalBytes = 0
         let rawSSE = ""  // accumulate full SSE for logging
-        const functionCalls: Array<{ name: string; args: Record<string, unknown> }> = []
+        const functionCalls: Array<{ name: string; args: Record<string, unknown>; thoughtSignature?: string }> = []
         let finishReason = ""
         let thinkingSignature = ""
         let inputTokens = 0, outputTokens = 0, cacheReadTokens = 0, thinkingTokens = 0
@@ -319,7 +326,11 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
                 }
               }
               if (part.functionCall) {
-                functionCalls.push({ name: part.functionCall.name, args: part.functionCall.args })
+                functionCalls.push({
+                  name: part.functionCall.name,
+                  args: part.functionCall.args,
+                  thoughtSignature: part.thoughtSignature,
+                })
               }
             }
           }
