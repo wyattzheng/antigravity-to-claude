@@ -314,7 +314,15 @@ export class Backend {
         child.stderr.on("data", (d: Buffer) => {
           const text = d.toString()
           for (const line of text.split("\n")) {
-            if (line.trim()) console.log(`[Binary] ${line}`)
+            if (!line.trim()) continue
+            // Suppress harmless telemetry errors
+            if (line.includes("Clearcut responded")) continue
+            // Downgrade TLS handshake noise (usually harmless stale connections)
+            if (line.includes("TLS handshake error")) {
+              console.debug(`[Binary] (debug) ${line}`)
+              continue
+            }
+            console.log(`[Binary] ${line}`)
           }
           const m = text.match(/listening on random port at (\d+) for HTTPS/)
           if (m && !resolved) {

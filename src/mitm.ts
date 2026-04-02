@@ -226,8 +226,15 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
     session.on("error", (e: Error) => {
       console.error(`[MITM] H2 session error:`, e.message)
       if (!res.writableEnded) {
-        if (!res.headersSent) res.writeHead(502)
-        res.end(e.message)
+        // Always return 200 + fake STOP to prevent LS from retrying
+        if (!res.headersSent) res.writeHead(200, { "Content-Type": "text/event-stream" })
+        const fakeChunk = JSON.stringify({
+          response: {
+            candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }],
+            usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 }
+          },
+        })
+        res.end(`data: ${fakeChunk}\r\n\r\n`)
       }
       if (ctx) {
         ctx.emitter.emit("event", { type: "error", message: `H2 error: ${e.message}` } satisfies MitmEvent)
@@ -385,8 +392,17 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
 
     h2req.on("error", (e: Error) => {
       console.error(`[MITM] Proxy error:`, e.message)
-      if (!res.headersSent) res.writeHead(502)
-      res.end(e.message)
+      if (!res.writableEnded) {
+        // Always return 200 + fake STOP to prevent LS from retrying
+        if (!res.headersSent) res.writeHead(200, { "Content-Type": "text/event-stream" })
+        const fakeChunk = JSON.stringify({
+          response: {
+            candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }],
+            usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 }
+          },
+        })
+        res.end(`data: ${fakeChunk}\r\n\r\n`)
+      }
       if (ctx) {
         ctx.emitter.emit("event", { type: "error", message: `Proxy error: ${e.message}` } satisfies MitmEvent)
       }
