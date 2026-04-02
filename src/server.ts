@@ -21,6 +21,11 @@ import {
   type AnthropicResponseBlock,
 } from "./translate.js"
 
+function ts(): string {
+  const d = new Date()
+  return d.toTimeString().slice(0, 8) + "." + String(d.getMilliseconds()).padStart(3, "0")
+}
+
 // ─── Request body type ───────────────────────────────────────────────────────
 
 interface MessagesRequest {
@@ -90,7 +95,7 @@ export function startLlmServer(opts: LlmServerOptions): { port: number; close():
 
     try {
       // Log ALL incoming requests for debugging
-      console.log(`[Server] ${req.method} ${req.url}`)
+      console.log(`[${ts()}] [Server] ${req.method} ${req.url}`)
 
       if (req.method === "GET" && req.url?.startsWith("/v1/models")) {
         return handleModels(res)
@@ -103,20 +108,20 @@ export function startLlmServer(opts: LlmServerOptions): { port: number; close():
         res.end(JSON.stringify({ status: "ok" }))
         return
       }
-      console.log(`[Server] 404: ${req.method} ${req.url}`)
+      console.log(`[${ts()}] [Server] 404: ${req.method} ${req.url}`)
       res.writeHead(404, { "Content-Type": "application/json" })
       res.end(JSON.stringify({ error: { type: "not_found_error", message: "Not found" } }))
     } catch (e) {
-      console.error("[Server] Error:", e)
+      console.error(`[${ts()}] [Server] Error:`, e)
       res.writeHead(500, { "Content-Type": "application/json" })
       res.end(JSON.stringify({ error: { type: "api_error", message: String(e) } }))
     }
   })
 
   server.listen(port, () => {
-    console.log(`[Server] Anthropic-compatible API listening on http://localhost:${port}`)
-    console.log(`[Server]   POST /v1/messages`)
-    console.log(`[Server]   GET  /v1/models`)
+    console.log(`[${ts()}] [Server] Anthropic-compatible API listening on http://localhost:${port}`)
+    console.log(`[${ts()}] [Server]   POST /v1/messages`)
+    console.log(`[${ts()}] [Server]   GET  /v1/models`)
   })
 
   return { port, close: () => server.close() }
@@ -168,7 +173,7 @@ async function handleMessages(
     return
   }
 
-  console.log(`[Server] POST /v1/messages model=${parsed.model} stream=${parsed.stream ?? false} messages=${parsed.messages.length} tools=${parsed.tools?.length ?? 0}`)
+  console.log(`[${ts()}] [Server] POST /v1/messages model=${parsed.model} stream=${parsed.stream ?? false} messages=${parsed.messages.length} tools=${parsed.tools?.length ?? 0}`)
 
   // Translate Anthropic → Gemini
   const systemPrompt = anthropicSystemToGemini(parsed.system)
@@ -190,9 +195,9 @@ async function handleMessages(
   const emitter = new EventEmitter()
 
   // Register in MITM store — the proxy will pick this up
-  console.log(`[Server] Creating cascade...`)
+  console.log(`[${ts()}] [Server] Creating cascade...`)
   const cascadeId = await backend.createCascade()
-  console.log(`[Server] Cascade created: ${cascadeId}`)
+  console.log(`[${ts()}] [Server] Cascade created: ${cascadeId}`)
 
   const ctx: RequestContext = {
     cascadeId,
@@ -206,15 +211,15 @@ async function handleMessages(
   }
 
   store.register(ctx)
-  console.log(`[Server] Context registered, sending message...`)
+  console.log(`[${ts()}] [Server] Context registered, sending message...`)
 
   // Send placeholder message to LS — triggers streamGenerateContent.
   // This is a long-lived streaming RPC (returns when cascade completes).
   // We get our response from MITM events, so just fire and catch errors.
   backend.sendMessage(cascadeId, `.<cid:${cascadeId}>`).catch((e) => {
-    console.log(`[Server] SendMessage RPC ended: ${e.message ?? "ok"}`)
+    console.log(`[${ts()}] [Server] SendMessage RPC ended: ${e.message ?? "ok"}`)
   })
-  console.log(`[Server] SendMessage fired, waiting for MITM response...`)
+  console.log(`[${ts()}] [Server] SendMessage fired, waiting for MITM response...`)
 
   if (parsed.stream) {
     await handleStreamingResponse(res, emitter, parsed.model, cascadeId)

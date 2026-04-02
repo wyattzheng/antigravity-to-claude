@@ -10,7 +10,7 @@
  * No agent/chat abstraction — just raw LS management.
  */
 
-import { createServer as createHttpServer, type Server as HttpServer } from "http"
+import { createServer as createHttpServer, request as httpRequest, type Server as HttpServer } from "http"
 import { request as httpsRequest } from "https"
 import { createServer as createNetServer } from "net"
 import { spawn, type ChildProcess } from "child_process"
@@ -129,6 +129,7 @@ export class Backend {
   /** Create a new cascade via RPC, return cascadeId */
   async createCascade(): Promise<string> {
     const res = await this.rpc("StartCascade")
+    console.log("[Backend] StartCascade response:", JSON.stringify(res))
     return res.cascadeId
   }
 
@@ -292,7 +293,7 @@ export class Backend {
 
         const child = spawn(binaryPath, [
           "--csrf_token", this.lsCsrf,
-          "--https_server_port", "0",
+          "--random_port",
           "--workspace_id", "agcc-session",
           "--cloud_code_endpoint", endpoint,
           "--app_data_dir", "antigravity",
@@ -324,7 +325,7 @@ export class Backend {
             }
             console.log(`[Binary] ${line}`)
           }
-          const m = text.match(/listening on random port at (\d+) for HTTPS/)
+          const m = text.match(/listening on random port at (\d+)/)
           if (m && !resolved) {
             resolved = true
             clearTimeout(timeout)

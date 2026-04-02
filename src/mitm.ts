@@ -22,6 +22,11 @@ mkdirSync(LOG_DIR, { recursive: true })
 const LOG_FILE = join(LOG_DIR, "mitm.log")
 const MAX_LOG_SIZE = 10 * 1024 * 1024 // 10MB
 
+function ts(): string {
+  const d = new Date()
+  return d.toTimeString().slice(0, 8) + "." + String(d.getMilliseconds()).padStart(3, "0")
+}
+
 function writeLog(reqId: number, request: any, response: any): void {
   try {
     // Truncate if too large
@@ -35,7 +40,7 @@ function writeLog(reqId: number, request: any, response: any): void {
     const entry = JSON.stringify({ ts: new Date().toISOString(), reqId, request, response })
     appendFileSync(LOG_FILE, entry + "\n", "utf-8")
   } catch (e: any) {
-    console.error(`[MITM] Failed to write log: ${e.message}`)
+    console.error(`[${ts()}] [MITM] Failed to write log: ${e.message}`)
   }
 }
 
@@ -48,7 +53,7 @@ function resolveGoogleIP(): Promise<string> {
   return new Promise((resolve) => {
     resolve4(GOOGLE_API_HOST, (err, addresses) => {
       if (err || !addresses?.length) {
-        console.warn(`[MITM] DNS resolve failed, using fallback IP`)
+        console.warn(`[${ts()}] [MITM] DNS resolve failed, using fallback IP`)
         resolve("142.250.80.95")
       } else {
         resolve(addresses[0])
@@ -121,7 +126,7 @@ function modifyRequest(body: Buffer, store: MitmStore): { modified: Buffer; ctx:
 
   const modified = Buffer.from(JSON.stringify(json))
   const saved = originalSize - modified.length
-  console.log(`[MITM] Request modified: ${changes.join(", ")} (${originalSize}→${modified.length} bytes, ${saved > 0 ? "-" : "+"}${Math.abs(saved)}B)`)
+  console.log(`[${ts()}] [MITM] Request modified: ${changes.join(", ")} (${originalSize}→${modified.length} bytes, ${saved > 0 ? "-" : "+"}${Math.abs(saved)}B)`)
 
   return { modified, ctx }
 }
@@ -137,7 +142,7 @@ export interface MitmProxy {
 
 export async function startMitmProxy(store: MitmStore, dataDir: string): Promise<MitmProxy> {
   const googleIP = await resolveGoogleIP()
-  console.log(`[MITM] Google API resolved to ${googleIP}`)
+  console.log(`[${ts()}] [MITM] Google API resolved to ${googleIP}`)
 
   let reqCounter = 0
 
@@ -160,10 +165,10 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
       const isGenerateContent = reqPath.includes("streamGenerateContent")
 
       if (isGenerateContent) {
-        console.log(`[MITM] #${reqId} streamGenerateContent (${body.length} bytes)`)
+        console.log(`[${ts()}] [MITM] #${reqId} streamGenerateContent (${body.length} bytes)`)
         const result = modifyRequest(body, store)
         if (!result.ctx) {
-          console.log(`[MITM] #${reqId} No context, returning STOP`)
+          console.log(`[${ts()}] [MITM] #${reqId} No context, returning STOP`)
           // Fake STOP response
           const fakeChunk = JSON.stringify({
             response: {
@@ -184,7 +189,8 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
       }
 
       // Non-generateContent → pass through
-      console.log(`[MITM] #${reqId} pass-through: ${reqMethod} ${reqPath} (${body.length} bytes)`)
+      const hasAuth = rawHeaders.some(([k]) => k.toLowerCase() === 'authorization')
+      console.log(`[${ts()}] [MITM] #${reqId} pass-through: ${reqMethod} ${reqPath} (${body.length} bytes, auth=${hasAuth})`)
       forwardToGoogle(reqId, reqMethod, reqPath, rawHeaders, body, null, res)
     })
   })
@@ -224,7 +230,7 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
     })
 
     session.on("error", (e: Error) => {
-      console.error(`[MITM] H2 session error:`, e.message)
+      console.error(`[${ts()}] [MITM] #${reqId} H2 session error:`, e.message)
       if (!res.writableEnded) {
         // Always return 200 + fake STOP to prevent LS from retrying
         if (!res.headersSent) res.writeHead(200, { "Content-Type": "text/event-stream" })
@@ -241,9 +247,21 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
       }
     })
 
+    session.on("goaway", (errorCode: number, lastStreamID: number) => {
+      console.error(`[${ts()}] [MITM] #${reqId} H2 GOAWAY: errorCode=${errorCode} lastStreamID=${lastStreamID}`)
+    })
+
+    session.on("close", () => {
+      console.log(`[${ts()}] [MITM] #${reqId} H2 session closed`)
+    })
+
     const h2req = session.request(h2Headers)
     h2req.write(finalBody)
     h2req.end()
+
+    h2req.on("close", () => {
+      console.log(`[${ts()}] [MITM] #${reqId} H2 stream closed`)
+    })
 
     let statusCode = 200
 
@@ -252,13 +270,13 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
 
       if (ctx) {
         // ── Intercepted: stream SSE to our client ──
-        console.log(`[MITM] #${reqId} Google response: ${statusCode}`)
+        console.log(`[${ts()}] [MITM] #${reqId} Google response: ${statusCode}`)
         if (statusCode !== 200) {
           const errChunks: Buffer[] = []
           h2req.on("data", (c: Buffer) => errChunks.push(c))
           h2req.on("end", () => {
             const errBody = Buffer.concat(errChunks).toString()
-            console.log(`[MITM] #${reqId} Error: ${errBody.substring(0, 500)}`)
+            console.log(`[${ts()}] [MITM] #${reqId} Error: ${errBody.substring(0, 500)}`)
             // Log error responses too
             try {
               const reqJson = JSON.parse(finalBody.toString())
@@ -281,18 +299,28 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
         }
 
         // Stream and parse SSE
+        const streamStartTime = Date.now()
         let sseBuffer = ""
         let accText = ""
         let accThinking = ""
         let totalBytes = 0
+        let chunkCount = 0
+        let sseEventCount = 0
+        let lastChunkTime = Date.now()
         let rawSSE = ""  // accumulate full SSE for logging
         const functionCalls: Array<{ name: string; args: Record<string, unknown>; thoughtSignature?: string }> = []
         let finishReason = ""
         let thinkingSignature = ""
         let inputTokens = 0, outputTokens = 0, cacheReadTokens = 0, thinkingTokens = 0
+        console.log(`[${ts()}] [MITM] #${reqId} SSE stream started, waiting for data...`)
 
         h2req.on("data", (chunk: Buffer) => {
+          chunkCount++
+          const now = Date.now()
+          const gap = now - lastChunkTime
+          lastChunkTime = now
           totalBytes += chunk.length
+          console.log(`[${ts()}] [MITM] #${reqId} chunk #${chunkCount}: ${chunk.length}B (total ${totalBytes}B, gap ${gap}ms)`)
           const chunkStr = chunk.toString()
           rawSSE += chunkStr
           sseBuffer += chunkStr
@@ -303,6 +331,7 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
           for (const line of parts) {
             const parsed = parseGeminiSSE(line)
             if (!parsed) continue
+            sseEventCount++
 
             const inner = (parsed as any).response ?? parsed
 
@@ -344,7 +373,10 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
         })
 
         h2req.on("end", () => {
-          console.log(`[MITM] #${reqId} Done: ${totalBytes}B, text=${accText.length}b, thinking=${accThinking.length}b`)
+          const elapsed = Date.now() - streamStartTime
+          console.log(`[${ts()}] [MITM] #${reqId} SSE stream ended: ${totalBytes}B in ${elapsed}ms, ${chunkCount} chunks, ${sseEventCount} SSE events`)
+          console.log(`[${ts()}] [MITM] #${reqId} Result: text=${accText.length}c, thinking=${accThinking.length}c, funcCalls=${functionCalls.length}, finish=${finishReason}`)
+          console.log(`[${ts()}] [MITM] #${reqId} Tokens: in=${inputTokens} out=${outputTokens} cache=${cacheReadTokens} thinking=${thinkingTokens}`)
           // Log request/response (log the modified body actually sent to Google)
           try {
             const reqJson = JSON.parse(finalBody.toString())
@@ -374,7 +406,7 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
         h2req.on("data", (chunk: Buffer) => { responseChunks.push(chunk) })
         h2req.on("end", () => {
           const fullBody = Buffer.concat(responseChunks)
-          console.log(`[MITM] #${reqId} pass-through response: ${statusCode} (${fullBody.length} bytes)`)
+          console.log(`[${ts()}] [MITM] #${reqId} pass-through response: ${statusCode} (${fullBody.length} bytes)`)
           const skipH2 = new Set([":status", "transfer-encoding", "connection"])
           const outHeaders: Record<string, string> = {}
           for (const [key, val] of Object.entries(responseHeaders)) {
@@ -391,7 +423,7 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
     })
 
     h2req.on("error", (e: Error) => {
-      console.error(`[MITM] Proxy error:`, e.message)
+      console.error(`[${ts()}] [MITM] #${reqId} Proxy error:`, e.message)
       if (!res.writableEnded) {
         // Always return 200 + fake STOP to prevent LS from retrying
         if (!res.headersSent) res.writeHead(200, { "Content-Type": "text/event-stream" })
@@ -411,7 +443,7 @@ export async function startMitmProxy(store: MitmStore, dataDir: string): Promise
   }
 
   server.listen(MITM_PORT, "127.0.0.1", () => {
-    console.log(`[MITM] HTTP proxy listening on 127.0.0.1:${MITM_PORT}`)
+    console.log(`[${ts()}] [MITM] HTTP proxy listening on 127.0.0.1:${MITM_PORT}`)
   })
 
   return {
