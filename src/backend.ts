@@ -13,7 +13,7 @@
 import { createServer as createHttpServer, type Server as HttpServer } from "http"
 import { request as httpsRequest } from "https"
 import { createServer as createNetServer } from "net"
-import { spawn, execSync, type ChildProcess } from "child_process"
+import { spawn, type ChildProcess } from "child_process"
 import { tmpdir, platform, homedir } from "os"
 import { join, dirname } from "path"
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs"
@@ -265,28 +265,8 @@ export class Backend {
     })
   }
 
-  /**
-   * Strip hardened runtime from Go binary on macOS so DYLD_INSERT_LIBRARIES works.
-   * No-op if already stripped or not on macOS.
-   */
-  private stripHardenedRuntime(binaryPath: string): void {
-    if (platform() !== "darwin") return
-    try {
-      const info = execSync(`codesign -dvv "${binaryPath}" 2>&1`, { encoding: "utf8" })
-      if (!info.includes("runtime")) return // already no hardened runtime
-      console.log("[Backend] Stripping hardened runtime from binary...")
-      execSync(`codesign --remove-signature "${binaryPath}"`, { stdio: "ignore" })
-      execSync(`codesign -s - "${binaryPath}"`, { stdio: "ignore" })
-      console.log("[Backend] ✅ Re-signed without hardened runtime")
-    } catch (e: any) {
-      console.log(`[Backend] ⚠ codesign strip failed: ${e.message}`)
-    }
-  }
 
   private spawnBinary(extPort: number, binaryPath: string): Promise<void> {
-    // Strip hardened runtime before spawn (macOS only, one-time)
-    this.stripHardenedRuntime(binaryPath)
-
     return new Promise((resolve, reject) => {
       const pipePath = join(tmpdir(), `agcc_${randomBytes(4).toString("hex")}`)
       const pipeServer = createNetServer(() => { })
